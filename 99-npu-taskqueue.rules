@@ -1,0 +1,3 @@
+# NPU 设备权限由 CANN 驱动管理: OWNER=HwHiAiUser, GROUP=HwHiAiUser, MODE=0660
+# 提权方案: 将用户从 HwHiAiUser 组移除，daemon 通过 runuser --supp-group HwHiAiUser 临时注入
+# 无需额外 udev 规则

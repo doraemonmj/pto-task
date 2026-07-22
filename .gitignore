@@ -1,0 +1,6 @@
+# 本地备份，历史版本用 git log 追溯即可
+*.bak
+*.bak.*
+
+# 受限用户真实名单含内部账号名，不入库；用 conf/restricted-users.example 占位
+conf/restricted-users
