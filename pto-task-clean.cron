@@ -1,4 +1,4 @@
 # 每天凌晨 3:17 清理过期的 done 和 logs（默认 1 天前）
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
-17 3 * * * root task-submit --clean --days 1 >> /var/lib/taskqueue/taskqueue.log 2>&1
+17 3 * * * root /usr/local/bin/task-submit --clean --days 1 2>&1 | logger -t taskqueue-clean; exit "${PIPESTATUS[0]}"

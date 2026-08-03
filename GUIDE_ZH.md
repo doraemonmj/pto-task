@@ -1,7 +1,6 @@
 # TaskQueue 使用说明
 
-> 中文版，与 [GUIDE.md](GUIDE.md) 内容一致。改动请两份一起改（见
-> [`.claude/rules/docs-language.md`](.claude/rules/docs-language.md)）。
+> 项目结构、安装和完整配置见 [README.md](README.md)。
 
 共享 NPU 机器的任务队列。提交你的命令，系统给你分一张卡并锁住，不用再和别人抢。
 

@@ -1,0 +1,7 @@
+[Unit]
+Description=PTO Task idle-only automatic updater
+
+[Service]
+Type=oneshot
+ExecStart=/home/pypto-tools/pto-task/app/pto-task-auto-update
+TimeoutStartSec=infinity

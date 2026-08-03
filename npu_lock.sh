@@ -1,6 +1,6 @@
 #!/bin/bash
 # npu-lock — NPU 设备互斥锁
-# 部署: setup.sh 安装到 /usr/local/bin/npu-lock
+# 作为 app/ 内部组件由 task-daemon 调用，不公开安装。
 #
 # 用法:
 #   npu-lock <device_id> -- <command...>       锁卡执行（支持逗号分隔多卡: 0,1）
@@ -10,11 +10,28 @@
 #   npu-lock <device_id>                       锁卡进子 shell，exit 释放
 #   npu-lock --status                          查看所有设备锁状态
 
-CONF_FILE="${TASKQUEUE_CONF:-/etc/taskqueue.conf}"
-if [ -f "$CONF_FILE" ]; then
-    source "$CONF_FILE"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ -n "${TASKQUEUE_LOCK_STATE_DIR:-}" ]]; then
+    # The daemon appends this trusted value after the submitted environment.
+    # Do not source a submitter-controlled TASKQUEUE_CONF in queued workloads.
+    STATE_DIR="$TASKQUEUE_LOCK_STATE_DIR"
+else
+    if [[ -n "${TASKQUEUE_CONF:-}" ]]; then
+        CONF_FILE="$TASKQUEUE_CONF"
+    elif [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then
+        CONF_FILE="$SCRIPT_DIR/../config/taskqueue.conf"
+    else
+        CONF_FILE="$SCRIPT_DIR/runtime/config/taskqueue.conf"
+    fi
+    if [ -f "$CONF_FILE" ]; then
+        source "$CONF_FILE"
+    fi
+    STATE_DIR="${STATE_DIR:-${BASE_DIR:-}}"
+    if [[ -z "$STATE_DIR" ]]; then
+        if [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then STATE_DIR="$SCRIPT_DIR/../state"; else STATE_DIR="$SCRIPT_DIR/runtime/state"; fi
+    fi
 fi
-LOCK_DIR="${BASE_DIR:-/tmp}/locks"
+LOCK_DIR="$STATE_DIR/locks"
 
 # 颜色（仅终端）
 if [[ -t 2 ]]; then
@@ -258,6 +275,18 @@ done
 all_locked=("${already_locked[@]}" "${need_lock[@]}")
 export NPU_LOCKED_DEVICE=$(IFS=','; echo "${all_locked[*]}")
 
+# workload 不能继承锁 fd。否则它派生出的后台进程可能在 npu-lock 退出后继续持锁，
+# 表现为设备已空闲但永远无法重新分配。父 npu-lock 仍持有 fd，锁语义不变。
+spawn_without_lock_fds() {
+    (
+        local fd
+        for fd in "${lock_fds[@]}"; do
+            exec {fd}>&-
+        done
+        exec "$@"
+    ) &
+}
+
 # 信号处理：转发给子进程并清理
 child_pid=""
 cleanup() {
@@ -275,7 +304,7 @@ trap cleanup SIGINT SIGTERM
 
 exit_code=0
 if [[ -n "$cmd_string" ]]; then
-    bash -c "$cmd_string" &
+    spawn_without_lock_fds bash -c "$cmd_string"
     child_pid=$!
     while wait "$child_pid" 2>/dev/null; ret=$?; do break; done
     # wait 可能被信号中断，循环确保子进程真正退出后才继续
@@ -283,7 +312,7 @@ if [[ -n "$cmd_string" ]]; then
     exit_code=${ret:-$?}
     child_pid=""
 elif [[ ${#cmd[@]} -gt 0 ]]; then
-    bash -c "$(build_cmd_string)" &
+    spawn_without_lock_fds bash -c "$(build_cmd_string)"
     child_pid=$!
     while wait "$child_pid" 2>/dev/null; ret=$?; do break; done
     while kill -0 "$child_pid" 2>/dev/null; do wait "$child_pid" 2>/dev/null; done
@@ -291,7 +320,12 @@ elif [[ ${#cmd[@]} -gt 0 ]]; then
     child_pid=""
 else
     echo "[npu-lock] 进入子 shell (设备 ${need_lock[*]})，exit 释放锁" >&2
-    NPU_LOCKED_DEVICE="$NPU_LOCKED_DEVICE" bash
+    (
+        for fd in "${lock_fds[@]}"; do
+            exec {fd}>&-
+        done
+        exec env NPU_LOCKED_DEVICE="$NPU_LOCKED_DEVICE" bash
+    )
     exit_code=$?
 fi
 

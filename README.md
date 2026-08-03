@@ -1,251 +1,161 @@
-# TaskQueue
+# NPU TaskQueue
 
-A lightweight task queue for shared Ascend NPU machines. It removes the "who
-gets which card" scramble: users submit commands with `task-submit`, a root
-daemon allocates a free card, takes a lock on it, and runs the command as the
-submitting user.
+Shared Ascend NPU task queue. The daemon allocates and locks NPU devices, then
+runs submitted work as the submitting user. The command-line options and task
+workflow of `task-submit` are unchanged. `task-submit` remains supported for
+existing users, and `pto-task` is the pypto-tools entry point.
 
-Documentation in this repository is written in English — see
-[`.claude/rules/docs-language.md`](.claude/rules/docs-language.md). Messages
-printed by the scripts themselves stay in Chinese, because that is what the
-people on this machine read.
+## Install and update
 
-New here? [`GUIDE.md`](GUIDE.md) is the user-facing manual — also available in
-Chinese as [`GUIDE_ZH.md`](GUIDE_ZH.md). [`ISSUES.md`](ISSUES.md) tracks known
-defects and past incidents — read it before changing the kill or scheduling
-paths.
+```bash
+# First install: creates the application layout and an initial local config.
+sudo bash setup.sh --init-config
 
-## Design
+# Update code only. Config and all queue state are preserved.
+sudo bash setup.sh
+```
 
-### Device pool
-
-The machine has 16 NPU cards (physical 0-15). `conf/available_devices` defines
-the pool that `--device auto` draws from; it currently holds
-`0,1,2,3,12,13,14,15`.
-
-An explicit `--device N` is **not** restricted to that pool — the whitelist only
-constrains automatic allocation.
-
-> The original design reserved 0-11 as "free" cards for direct terminal use and
-> 12-15 as a protected pool. The pool in use is deliberately wider than that.
-> `conf/available_devices` is the authority — do not infer the pool from the
-> historical split.
-
-### Three layers
-
-| Layer | Component | Mechanism | Purpose |
-|---|---|---|---|
-| Device access | `HwHiAiUser` group | `/dev/davinci*` is `0660 root:HwHiAiUser` | A restricted user's own shell cannot open a device |
-| Device mutex | `npu-lock` / flock | One lock file per device | Two queued tasks never share a card |
-| Device allocation | daemon / `available_devices` | Whitelist | Bounds what `--device auto` may hand out |
-
-Access control is group membership: restricted users are removed from
-`HwHiAiUser`, and the daemon adds the group back for the duration of a task via
-`runuser --supp-group HwHiAiUser`. The membership list is maintained by hand
-(`gpasswd -d <user> HwHiAiUser`); `conf/restricted-users` records who should be
-restricted but is not read by any script.
-
-`taskqueue-npu.sh` (profile.d) and `99-npu-taskqueue.rules` (udev) are inert
-placeholders kept for deployment symmetry. Neither sets anything.
-
-### Task lifecycle
-
-1. `task-submit` writes a task file into `pending/` and snapshots the user's
-   environment next to it.
-2. The daemon allocates a device from the whitelist (`auto` mode) or uses the
-   requested one, then moves the task to `running/`.
-3. `npu-lock` takes an exclusive `flock` on each allocated device.
-4. `runuser` drops privileges to the submitting user, with `HwHiAiUser` added.
-5. On exit the daemon sweeps surviving descendants, releases the locks, and
-   writes a `done/` record.
-
-### Device numbering
-
-**Card numbers are physical.** Nothing in the deployed path sets
-`ASCEND_RT_VISIBLE_DEVICES` — `task-submit` even strips it out of the
-environment snapshot — so there is no remapping and no logical 0-based view.
-
-The daemon tells a task which card it got in three interchangeable ways:
-
-- appends `--device <N>` to the command (only for `--device auto`, and only when
-  the command does not already specify a device),
-- substitutes `{}` anywhere in the command,
-- exports `TASK_DEVICE=<N>`.
-
-Use whichever fits the program, but use one of them. Hard-coding a card number,
-or assuming the allocated card appears as device 0, means holding a lock on one
-card and computing on another.
-
-## Components
-
-| File | Role |
-|---|---|
-| `task-submit.sh` | User CLI: submit, wait, log, cancel, kill, list, clean, maintenance, device whitelist |
-| `task-daemon.sh` | Root daemon: poll `pending/`, allocate devices, drop privileges, watchdog, reap orphans |
-| `npu_lock.sh` | flock-based device mutex; multi-card locking in ascending order to avoid deadlock |
-| `taskqueue-npu.sh` | profile.d placeholder (inert) |
-| `99-npu-taskqueue.rules` | udev placeholder (inert — CANN owns the device nodes) |
-| `taskqueue.service` | systemd unit |
-| `setup.sh` | First-time install, system-wide or `--local` |
-| `deploy.sh` | Re-deploy after source changes |
-| `claude-skill/task-submit/` | Skill shipped to *users* of the queue, to be installed on their machines |
-| `.claude/` | Rules and skills for developing *this* repository |
-
-## Layout
-
-### Source
+The default installation is:
 
 ```text
-npu-taskqueue/
-├── conf/                          # configuration — edit here, then deploy
-│   ├── taskqueue.conf             # BASE_DIR, MAX_CONCURRENT
-│   ├── available_devices          # --device auto pool
-│   └── restricted-users           # roster (git-ignored; .example is committed)
-├── task-daemon.sh
-├── task-submit.sh
-├── npu_lock.sh
-├── taskqueue-npu.sh
-├── 99-npu-taskqueue.rules
-├── taskqueue.service
-├── taskqueue-clean.cron
-├── deploy.sh
-├── setup.sh
-├── docs/                          # topic docs (interactive mode, …)
-├── claude-skill/                  # skill for queue users
-├── .claude/
-│   ├── CLAUDE.md                  # index for agents working on this repo
-│   ├── rules/                     # conventions (see below)
-│   └── skills/                    # verify, deploy, code-review, git-commit, …
-├── AGENTS.md                      # short pointer for non-Claude agents
-├── GUIDE.md                       # user manual
-├── GUIDE_ZH.md                    # its Chinese mirror — edit both together
-├── ISSUES.md                      # known defects and incident history
-└── README.md                      # this file
+/home/pypto-tools/pto-task/
+├── app/       # deployed programs: task-submit, task-daemon, npu_lock.sh
+├── config/    # local taskqueue.conf; never overwritten by an update
+├── state/     # pending, running, done, locks, FIFO and daemon state
+├── logs/      # task and daemon logs
+└── tmp/       # temporary files
 ```
 
-`.claude/rules/` holds the conventions that apply to the whole repository:
+Use `--tools-root DIR` to install below another root, for example
+`sudo bash setup.sh --tools-root /srv/pypto-tools --init-config`. Installation
+must be run as root from an administrator-reviewed checkout. It copies files
+and creates missing directories, but does not start, restart, or signal the
+task daemon. `/home/pypto-tools` is the default tools root.
 
-| Rule | Covers |
-|---|---|
-| `core-development.md` | Bash correctness, the root/user boundary, kill paths, secrets |
-| `deployment-integrity.md` | The repo is the source of truth; deploy pre-flight |
-| `problem-handling.md` | Where a defect gets recorded, and what may be published |
-| `docs-language.md` | English Markdown, Chinese CLI output |
-| `documentation-length.md` | Size limits and how to split |
+`/usr/local/bin/task-submit` and `/usr/local/bin/pto-task` are symbolic links
+to the same `<tools-root>/pto-task/app/task-submit` program. No
+`npu-lock` or daemon command alias is installed in `/usr/local/bin`.
 
-### Runtime (`BASE_DIR`)
-
-```text
-/var/lib/taskqueue/
-├── pending/           queued tasks (mode 1777)
-├── running/           in-flight tasks
-├── done/              completion records
-├── logs/              per-task logs
-├── locks/             NPU lock files
-├── kill/              termination requests
-├── fifo/              stdin pipes for interactive tasks
-├── available_devices  runtime whitelist (SIGHUP reloads it)
-├── maintenance        present ⇒ scheduling paused
-├── taskqueue.log      daemon log (rotates at 1 MB)
-└── task-daemon.pid
-```
-
-## Deployment
-
-**The repository is the source of truth.** Never edit `/usr/local/bin/task-submit`
-or the other installed copies in place — a later `deploy.sh` silently rolls those
-edits back. That is not hypothetical: it produced a CI job that reported green
-for a week without running its tests (`ISSUES.md`, issue 4). See
-[`.claude/rules/deployment-integrity.md`](.claude/rules/deployment-integrity.md).
-
-| Source | Installed to |
-|---|---|
-| `task-daemon.sh` | `/usr/local/sbin/task-daemon` |
-| `task-submit.sh` | `/usr/local/bin/task-submit` |
-| `npu_lock.sh` | `/usr/local/bin/npu-lock` |
-| `taskqueue.service` | `/etc/systemd/system/taskqueue.service` |
-| `99-npu-taskqueue.rules` | `/etc/udev/rules.d/` |
-| `taskqueue-npu.sh` | `/etc/profile.d/` |
-| `taskqueue-clean.cron` | `/etc/cron.d/taskqueue-clean` |
-| `conf/taskqueue.conf` | `/etc/taskqueue.conf` |
-| `conf/available_devices` | `/var/lib/taskqueue/available_devices` |
-| `conf/restricted-users` | `/etc/taskqueue-restricted-users` |
-
-### First install
+Start the private daemon separately when the host is ready:
 
 ```bash
-sudo bash setup.sh --max-concurrent 15
+TOOLS_ROOT=/home/pypto-tools  # or the value passed to --tools-root
+sudo "$TOOLS_ROOT/pto-task/app/task-daemon"
 ```
 
-A `--local` mode installs everything under `$HOME` for testing, with no root and
-no impact on the shared queue:
+## Usage
+
+Both commands are equivalent; existing users can keep using `task-submit`.
+Every option and argument pattern is retained.
 
 ```bash
-bash setup.sh --local --max-concurrent 2
+task-submit --device auto --run "python train.py"
+task-submit --device auto --device-num 2 --run "python train.py --devices 0,1"
+pto-task --device 3 --run "python train.py --device 3"
+task-submit --run "pytest tests/"
+task-submit --list
+pto-task --status <task-id>
+task-submit --log <task-id>
+task-submit --wait <task-id>
+task-submit --cancel <task-id>
+task-submit --kill <task-id>
+pto-task --stats --days 7
 ```
 
-### Update
+`--max-time` defaults to 300 seconds; `--timeout` defaults to 600 seconds and
+only controls client waiting. Project-local `task-submit.conf` device policies
+and the existing `TASKQUEUE_DEVICE_*` environment controls continue to work.
+
+## Configuration and security
+
+`config/taskqueue.conf` is Bash-style `KEY=value` configuration. Keep it
+administrator-writable and never place passwords, access tokens, or other
+credentials in it. The software does not store or print credentials.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `MAX_CONCURRENT` | `10` | Maximum simultaneously running jobs |
+| `MAX_TIME_HARD_CAP` | `0` | Server maximum task duration; `0` means unlimited |
+| `KILL_GRACE` | `5` | Seconds from SIGTERM to SIGKILL |
+| `TASK_EXECUTION_MODE` | `HwHiAiUser` | Task identity: submitter with NPU group, or `root` |
+| `AVAILABLE_DEVICES` | empty | Comma-separated automatic device pool; empty detects devices |
+
+`STATE_DIR` and `LOGS_DIR` are set by the installer to the unified deployment
+tree. Do not point them at `/data` or a user home directory.
+
+### Task execution identity
+
+The daemon itself must run as root to schedule work. By default,
+`TASK_EXECUTION_MODE="HwHiAiUser"` runs a normal user's task as that submitting
+user with the `HwHiAiUser` NPU device group; it does **not** run the task as
+root. Set `TASK_EXECUTION_MODE="root"` in the installed configuration only
+when every queue submitter is trusted: it makes every queued command root
+privileged. Restart the daemon after changing this setting.
+
+## NPU usage statistics
+
+`pto-task --stats [--days N]` (or `task-submit --stats`) reports task count,
+card-hours, and sampled NPU utilization. An unprivileged caller sees only their
+own records; root sees the per-user aggregate. The report is read-only. Its
+sampler is an independent timer; it only reads NPU utilization for cards owned
+by running queue tasks and never participates in scheduling.
+
+Sampling and its timer are disabled by default. Enable it in the local
+configuration, then rerun `sudo bash setup.sh` to install and enable the timer;
+the task daemon does not need a restart:
 
 ```bash
-sudo bash deploy.sh
+# /home/pypto-tools/pto-task/config/taskqueue.conf
+USAGE_SAMPLING_ENABLED=true
 ```
 
-`deploy.sh` restarts the daemon, and the default systemd `KillMode` takes the
-running tasks down with it. Check for in-flight work first:
+Samples are stored in `state/usage/YYYYMMDD.csv`. The sampler uses a per-run
+lock and a timeout for every `npu-smi` call, so a stalled device cannot block
+the queue daemon.
+
+## Source checkout mode
+
+The Git checkout remains source only. Running `task-submit.sh`,
+`task-daemon.sh`, or `npu_lock.sh` directly resolves configuration at the
+ignored `runtime/config/taskqueue.conf`, and uses `runtime/state`,
+`runtime/logs`, and `runtime/tmp`. Create that local configuration from the
+template when needed:
 
 ```bash
-task-submit --list                     # anything under "Running"?
-sudo task-submit --maintenance on "deploying"   # stop new work, let running drain
-sudo bash deploy.sh
-sudo task-submit --maintenance off
+mkdir -p runtime/config runtime/state runtime/logs runtime/tmp
+cp config/default.conf runtime/config/taskqueue.conf
+./task-submit.sh --help
 ```
 
-`BASE_DIR` is per-machine and is **not** synced. `deploy.sh` keeps whatever the
-host's `/etc/taskqueue.conf` already says, syncs the other keys from
-`conf/taskqueue.conf`, preserves any host-only keys it finds, and refuses to
-start if `BASE_DIR` does not exist. The value committed here is only the
-fallback for a host that has never been installed.
+`runtime/` is intentionally git-ignored. It keeps local test state out of both
+Git and deployed installations.
 
-### Day-to-day
+## Automatic updates
+
+The automatic-update timer is enabled by default for a root installation with
+initialized configuration. The installer records the source repository's Git
+`origin` after removing embedded HTTP credentials. It follows the configured,
+access-controlled branch:
 
 ```bash
-sudo systemctl status taskqueue                       # daemon state
-BASE_DIR=$(. /etc/taskqueue.conf; echo "$BASE_DIR")   # this host's data dir
-cat "$BASE_DIR/taskqueue.log"                         # daemon log
-sudo systemctl restart taskqueue                      # restart (kills running tasks)
+AUTO_UPDATE_REPOSITORY="git@github.com:pypto-tools/npu-taskqueue.git"
+AUTO_UPDATE_BRANCH="main"
 ```
 
-### Changing the restricted-user roster
-
-Edit `conf/restricted-users`, then apply the group change by hand — `deploy.sh`
-copies the file but nothing reads it:
+Restrict repository write and merge access because the updater executes the
+selected branch's `setup.sh` as root. To opt out of installing the timer:
 
 ```bash
-sudo gpasswd -d <user> HwHiAiUser      # restrict
-sudo gpasswd -a <user> HwHiAiUser      # unrestrict
+sudo bash setup.sh --disable-auto-update
 ```
 
-The user must log out and back in for the group change to take effect.
+The timer starts at 03:17 daily. It fetches first into `tmp/`, then takes an
+exclusive update reservation and waits up to
+six hours for both `state/pending` and `state/running` to be empty, checking
+every five minutes. It updates only `app/`, preserves `config/` and `state/`,
+and never restarts the daemon; the update is recorded in `logs/auto-update.log`.
+For private repositories, configure host Git/SSH credentials outside this
+configuration file; never put tokens or passwords in it.
 
-### Changing the device pool
-
-At runtime, without a deploy (takes effect immediately via SIGHUP):
-
-```bash
-sudo task-submit --devices "2,3,4,5"
-sudo task-submit --devices status
-sudo task-submit --devices reset       # back to auto-detection
-```
-
-Persistently: edit `conf/available_devices` and run `sudo bash deploy.sh`. Note
-that a deploy overwrites whatever `--devices` set at runtime.
-
-### Maintenance mode
-
-```bash
-sudo task-submit --maintenance on "CANN driver upgrade"
-sudo task-submit --maintenance status
-sudo task-submit --maintenance off
-```
-
-Queued tasks stop being scheduled; running tasks continue.
+For a concise Chinese usage guide, see [GUIDE_ZH.md](GUIDE_ZH.md). AI agents
+can use [skills/pto-task-operations/SKILL.md](skills/pto-task-operations/SKILL.md).

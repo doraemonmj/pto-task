@@ -1,0 +1,8 @@
+[Unit]
+Description=PTO Task NPU usage sampler
+
+[Service]
+Type=oneshot
+ExecStart=/home/pypto-tools/pto-task/app/pto-task-usage-sampler
+Nice=10
+IOSchedulingClass=idle

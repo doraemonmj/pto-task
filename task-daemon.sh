@@ -1,23 +1,63 @@
 #!/bin/bash
 # task-daemon: root task queue daemon
 
-CONF_FILE="${TASKQUEUE_CONF:-/etc/taskqueue.conf}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ -n "${TASKQUEUE_CONF:-}" ]]; then
+    CONF_FILE="$TASKQUEUE_CONF"
+elif [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then
+    CONF_FILE="$SCRIPT_DIR/../config/taskqueue.conf"
+else
+    CONF_FILE="$SCRIPT_DIR/runtime/config/taskqueue.conf"
+fi
 if [ ! -f "$CONF_FILE" ]; then
-    echo "error: $CONF_FILE not found, run setup.sh first" >&2
+    echo "error: $CONF_FILE not found; install with setup.sh --init-config or set TASKQUEUE_CONF" >&2
+    exit 1
+fi
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "error: task-daemon must run as root (including TASK_EXECUTION_MODE=HwHiAiUser)" >&2
+    exit 1
+fi
+CONFIG_DIR="$(dirname "$CONF_FILE")"
+if [[ -L "$CONFIG_DIR" || -L "$CONF_FILE" ||
+      "$(stat -c %u "$CONFIG_DIR")" -ne 0 || "$(stat -c %u "$CONF_FILE")" -ne 0 ||
+      $((8#$(stat -c %a "$CONFIG_DIR") & 8#022)) -ne 0 ||
+      $((8#$(stat -c %a "$CONF_FILE") & 8#022)) -ne 0 ]]; then
+    echo "error: $CONF_FILE and its parent must be root-owned, non-symlink, and not group/world-writable" >&2
     exit 1
 fi
 source "$CONF_FILE"
-PENDING_DIR="$BASE_DIR/pending"
-RUNNING_DIR="$BASE_DIR/running"
-DONE_DIR="$BASE_DIR/done"
-LOGS_DIR="$BASE_DIR/logs"
-KILL_DIR="$BASE_DIR/kill"
-FIFO_DIR="$BASE_DIR/fifo"
-LOG_FILE="$BASE_DIR/taskqueue.log"
+STATE_DIR="${STATE_DIR:-${BASE_DIR:-}}"
+if [[ -z "$STATE_DIR" ]]; then
+    if [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then STATE_DIR="$SCRIPT_DIR/../state"; else STATE_DIR="$SCRIPT_DIR/runtime/state"; fi
+fi
+LOGS_DIR="${LOGS_DIR:-${STATE_DIR%/state}/logs}"
+PENDING_DIR="$STATE_DIR/pending"
+RUNNING_DIR="$STATE_DIR/running"
+DONE_DIR="$STATE_DIR/done"
+KILL_DIR="$STATE_DIR/kill"
+FIFO_DIR="$STATE_DIR/fifo"
+LOG_FILE="$LOGS_DIR/taskqueue.log"
 POLL_INTERVAL=0.2
 KILL_GRACE=${KILL_GRACE:-5}   # --kill 后等待 SIGTERM 优雅退出的宽限期(秒)，超时升级到 SIGKILL
 MAX_CONCURRENT=${MAX_CONCURRENT:-1}
-MAINT_FILE="$BASE_DIR/maintenance"
+# 用户可请求更短超时，但不能绕过服务器硬上限。0 表示服务器不设硬上限。
+MAX_TIME_HARD_CAP=${MAX_TIME_HARD_CAP:-0}
+TASK_EXECUTION_MODE="${TASK_EXECUTION_MODE:-HwHiAiUser}"
+case "$TASK_EXECUTION_MODE" in
+    HwHiAiUser|root) ;;
+    *) echo "error: TASK_EXECUTION_MODE must be HwHiAiUser or root" >&2; exit 1 ;;
+esac
+if [[ "$TASK_EXECUTION_MODE" == HwHiAiUser ]]; then
+    command -v setpriv >/dev/null 2>&1 || {
+        echo "error: TASK_EXECUTION_MODE=HwHiAiUser requires setpriv" >&2
+        exit 1
+    }
+    getent group HwHiAiUser >/dev/null 2>&1 || {
+        echo "error: required group HwHiAiUser does not exist" >&2
+        exit 1
+    }
+fi
+MAINT_FILE="$STATE_DIR/maintenance"
 CURRENT_JOBS=0
 
 parse_task_file() {
@@ -25,7 +65,6 @@ parse_task_file() {
     SUBMIT_USER=""
     SUBMIT_TIME=""
     WORK_DIR=""
-    USER_HOME=""
     COMMAND=""
     DEVICE=""
     DEVICE_AUTO=0
@@ -37,7 +76,6 @@ parse_task_file() {
             SUBMIT_USER) SUBMIT_USER="$value" ;;
             SUBMIT_TIME) SUBMIT_TIME="$value" ;;
             WORK_DIR)    WORK_DIR="$value" ;;
-            USER_HOME)   USER_HOME="$value" ;;
             COMMAND)     COMMAND="$value" ;;
             DEVICE)      DEVICE="$value" ;;
             DEVICE_AUTO) DEVICE_AUTO="$value" ;;
@@ -45,19 +83,22 @@ parse_task_file() {
             MAX_TIME)    MAX_TIME="$value" ;;
             INTERACTIVE) INTERACTIVE="$value" ;;
         esac
-    done < "$file"
+    done < "$file" 2>/dev/null
 }
 
 # 纯 bash 提取单个 KEY=VALUE 字段，避免 grep+cut 的 fork 开销。
 # 用法: val=$(read_field DEVICE /path/to/task_file)
 read_field() {
     local key="$1" file="$2" k v
+    # 轮询期间另一个调度路径可能刚把 pending 文件移到 running。
+    # 消失是正常竞态，静默返回未命中即可。
+    [ -f "$file" ] || return 1
     while IFS='=' read -r k v; do
         if [ "$k" = "$key" ]; then
             printf '%s' "$v"
             return 0
         fi
-    done < "$file"
+    done < "$file" 2>/dev/null
     return 1
 }
 
@@ -210,7 +251,7 @@ find_free_devices() {
 
 # 加载运行时设备白名单到内存（启动时和收到 SIGHUP 时调用）
 load_runtime_devices() {
-    local runtime_file="$BASE_DIR/available_devices"
+    local runtime_file="$STATE_DIR/available_devices"
     if [[ -f "$runtime_file" ]]; then
         RUNTIME_DEVICES=$(tr -d '[:space:]' < "$runtime_file" 2>/dev/null)
         log "loaded runtime devices: ${RUNTIME_DEVICES:-<empty>}"
@@ -218,6 +259,36 @@ load_runtime_devices() {
         RUNTIME_DEVICES=""
         log "no runtime device whitelist (using AVAILABLE_DEVICES or auto-detect)"
     fi
+}
+
+# SIGHUP 热加载不会改变 BASE_DIR；目录迁移仍需要停服。
+reload_runtime_config() {
+    local old_state="$STATE_DIR"
+    local new_max new_cap new_grace
+
+    # 配置由 root 管理。只在信号路径读取三个支持热更新的整数键。
+    read_hot_key() {
+        local wanted="$1" line value=""
+        while IFS= read -r line; do
+            case "$line" in
+                "$wanted"=*) value="${line#*=}" ;;
+            esac
+        done < "$CONF_FILE"
+        value="${value%%[[:space:]]#*}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        printf '%s' "$value"
+    }
+    new_max=$(read_hot_key MAX_CONCURRENT)
+    new_cap=$(read_hot_key MAX_TIME_HARD_CAP)
+    new_grace=$(read_hot_key KILL_GRACE)
+
+    [[ "$new_max" =~ ^[1-9][0-9]*$ ]] && MAX_CONCURRENT="$new_max"
+    [[ "$new_cap" =~ ^[0-9]+$ ]] && MAX_TIME_HARD_CAP="$new_cap"
+    [[ "$new_grace" =~ ^[0-9]+$ ]] && KILL_GRACE="$new_grace"
+    STATE_DIR="$old_state"
+    load_runtime_devices
+    log "config reloaded: max_concurrent=$MAX_CONCURRENT hard_cap=$MAX_TIME_HARD_CAP kill_grace=$KILL_GRACE"
 }
 
 # 列出某 session 内仍存活的所有进程。任务经 setsid 启动，SID==TASK_PID，
@@ -308,14 +379,18 @@ finalize_interrupted() {
     local exit_code="${2:-137}"
     local rf="$RUNNING_DIR/$task_id"
     [ -f "$rf" ] || return 0
-    local submit_user submit_time command
-    submit_user=$(read_field SUBMIT_USER "$rf")
-    submit_time=$(read_field SUBMIT_TIME "$rf")
-    command=$(read_field COMMAND "$rf")
+    local submit_user submit_time command device start_time
+    submit_user=$(read_field SUBMIT_USER "$rf" || true)
+    submit_time=$(read_field SUBMIT_TIME "$rf" || true)
+    command=$(read_field COMMAND "$rf" || true)
+    device=$(read_field DEVICE "$rf" || true)
+    start_time=$(read_field START_TIME "$rf" || true)
     cat > "$DONE_DIR/$task_id" <<EOF
 SUBMIT_USER=$submit_user
 SUBMIT_TIME=$submit_time
 COMMAND=$command
+DEVICE=$device
+START_TIME=$start_time
 FINISH_TIME=$(date -Iseconds)
 EXIT_CODE=$exit_code
 EOF
@@ -378,6 +453,7 @@ run_task() {
     # 归属 marker：任务的每个后代都继承它，包括 setsid 出去、SID/PGID 都不再指向
     # 本任务的那些。清扫时靠它认人（见 marked_pids）。
     env_args+=(TASKQUEUE_TASK_ID="$task_id")
+    env_args+=(TASKQUEUE_LOCK_STATE_DIR="$STATE_DIR")
 
     # 设备环境变量注入
     # 设备互斥靠 npu-lock 保证，设备选择靠自动追加 --device 参数
@@ -422,10 +498,6 @@ run_task() {
     local task_script="$LOGS_DIR/${task_id}.sh"
     {
         echo '#!/bin/bash'
-        # Source user-level env setup if present
-        if [ -n "$USER_HOME" ] && [ -f "$USER_HOME/.task-env" ]; then
-            echo "source '$USER_HOME/.task-env'"
-        fi
         # cd to working directory
         if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
             echo "cd '$WORK_DIR'"
@@ -438,7 +510,7 @@ run_task() {
     # daemon 统一包装 npu-lock（兼容旧任务：命令已含 npu-lock 则跳过）
     local exec_cmd="bash '$task_script'"
     if [[ -n "$DEVICE" && "$DEVICE" != "none" && "$COMMAND" != *npu-lock* ]]; then
-        exec_cmd="npu-lock $DEVICE --timeout 0 -- bash '$task_script'"
+        exec_cmd="'$SCRIPT_DIR/npu_lock.sh' $DEVICE --timeout 0 -- bash '$task_script'"
     fi
 
     local task_log="$LOGS_DIR/${task_id}.log"
@@ -460,24 +532,57 @@ run_task() {
         log "interactive: fifo=$fifo_path keeper=$fifo_keeper_pid"
     fi
 
-    # 降权执行：以提交用户身份运行，注入 HwHiAiUser 补充组获取 NPU 设备访问权限
-    if [ -n "$SUBMIT_USER" ] && [ "$SUBMIT_USER" != "root" ] && [ "$(id -u)" -eq 0 ]; then
-        setsid runuser -u "$SUBMIT_USER" --supp-group HwHiAiUser -- env "${env_args[@]}" /bin/bash -c "$exec_cmd" < "$stdin_src" > "$task_log" 2>&1 &
-    else
-        setsid env "${env_args[@]}" /bin/bash -c "$exec_cmd" < "$stdin_src" > "$task_log" 2>&1 &
-    fi
+    local start_iso; start_iso=$(date -Iseconds)
+    case "$TASK_EXECUTION_MODE" in
+        HwHiAiUser)
+            # 保留提交用户 UID，HwHiAiUser 只提供 NPU 访问权限。
+            if [ -n "$SUBMIT_USER" ] && [ "$SUBMIT_USER" != root ] && [ "$(id -u)" -eq 0 ]; then
+                local primary_gid user_groups hw_gid group_csv
+                primary_gid=$(id -g "$SUBMIT_USER" 2>/dev/null) || {
+                    write_reject "$task_id" "error: submit user '$SUBMIT_USER' does not exist"
+                    return 0
+                }
+                user_groups=$(id -G "$SUBMIT_USER")
+                hw_gid=$(getent group HwHiAiUser | cut -d: -f3)
+                case " $user_groups " in
+                    *" $hw_gid "*) ;;
+                    *) user_groups="$user_groups $hw_gid" ;;
+                esac
+                group_csv="${user_groups// /,}"
+                setsid setpriv --reuid "$SUBMIT_USER" --regid "$primary_gid" \
+                    --groups "$group_csv" -- env "${env_args[@]}" /bin/bash -c "$exec_cmd" \
+                    < "$stdin_src" > "$task_log" 2>&1 &
+            else
+                setsid env "${env_args[@]}" /bin/bash -c "$exec_cmd" < "$stdin_src" > "$task_log" 2>&1 &
+            fi
+            ;;
+        root)
+            log "exec: $task_id configured for root execution (submitted by $SUBMIT_USER)"
+            setsid env "${env_args[@]}" /bin/bash -c "$exec_cmd" < "$stdin_src" > "$task_log" 2>&1 &
+            ;;
+    esac
     local task_pid=$!
     echo "TASK_PID=$task_pid" >> "$RUNNING_DIR/$task_id"
+    echo "START_TIME=$start_iso" >> "$RUNNING_DIR/$task_id"
 
-    log "exec: pid=$task_pid (max_time=${MAX_TIME}s)"
+    # pending/ 是 1777，任务字段必须在 daemon 侧再次校验。
+    local effective_max_time="$MAX_TIME"
+    [[ "$effective_max_time" =~ ^[0-9]+$ ]] || effective_max_time=300
+    if [[ "$MAX_TIME_HARD_CAP" =~ ^[0-9]+$ ]] &&
+       (( MAX_TIME_HARD_CAP > 0 )) &&
+       (( effective_max_time == 0 || effective_max_time > MAX_TIME_HARD_CAP )); then
+        effective_max_time="$MAX_TIME_HARD_CAP"
+    fi
+
+    log "exec: pid=$task_pid (max_time=${effective_max_time}s)"
 
     # 超时看门狗：超过 MAX_TIME 自动 kill（0=不限时）
     local watchdog_pid=""
-    if [ "$MAX_TIME" -gt 0 ] 2>/dev/null; then
+    if (( effective_max_time > 0 )); then
         (
-            sleep "$MAX_TIME"
+            sleep "$effective_max_time"
             if kill -0 "$task_pid" 2>/dev/null; then
-                echo "[taskqueue] 任务超时 (${MAX_TIME}s)，已自动终止" >> "$task_log"
+                echo "[taskqueue] 任务超时 (${effective_max_time}s)，已自动终止" >> "$task_log"
                 kill -TERM -- -"$task_pid" 2>/dev/null
                 sleep 3
                 kill -0 "$task_pid" 2>/dev/null && kill -KILL -- -"$task_pid" 2>/dev/null
@@ -513,6 +618,8 @@ run_task() {
 SUBMIT_USER=$SUBMIT_USER
 SUBMIT_TIME=$SUBMIT_TIME
 COMMAND=$COMMAND
+DEVICE=$DEVICE
+START_TIME=$start_iso
 FINISH_TIME=$(date -Iseconds)
 EXIT_CODE=$exit_code
 LOG_FILE=$task_log
@@ -537,7 +644,7 @@ if [ "$(id -u)" -ne 0 ] && [ -z "${TASKQUEUE_ALLOW_USER:-}" ]; then
 fi
 
 # 单例保护：防止多个 daemon 同时运行
-PID_FILE="$BASE_DIR/task-daemon.pid"
+PID_FILE="$STATE_DIR/task-daemon.pid"
 if [ -f "$PID_FILE" ]; then
     old_pid=$(cat "$PID_FILE" 2>/dev/null)
     if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
@@ -575,7 +682,7 @@ cleanup() {
     rm -f "$PID_FILE"
 }
 trap cleanup SIGTERM SIGINT
-trap 'load_runtime_devices' SIGHUP
+trap 'reload_runtime_config' SIGHUP
 
 # 启动时加载一次设备白名单到内存
 load_runtime_devices

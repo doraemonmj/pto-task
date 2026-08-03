@@ -13,22 +13,36 @@
 #   task-submit --clean [--days N]                  清理已完成任务（默认 7 天前）
 #   task-submit --maintenance [on|off|status]       维护模式管理
 
-BASE_DIR=
-CONF_FILE="${TASKQUEUE_CONF:-/etc/taskqueue.conf}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ -n "${TASKQUEUE_CONF:-}" ]]; then
+    CONF_FILE="$TASKQUEUE_CONF"
+elif [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then
+    # Installed layout: <tool>/app/task-submit, <tool>/config/taskqueue.conf.
+    CONF_FILE="$SCRIPT_DIR/../config/taskqueue.conf"
+else
+    # Source layout keeps all mutable files below the ignored runtime/ tree.
+    CONF_FILE="$SCRIPT_DIR/runtime/config/taskqueue.conf"
+fi
+STATE_DIR=""
+LOGS_DIR=""
 if [ -f "$CONF_FILE" ]; then
     source "$CONF_FILE"
 fi
-if [ -z "$BASE_DIR" ]; then
-    echo "错误: $CONF_FILE 不存在，请先运行 setup.sh 或设置 TASKQUEUE_CONF" >&2
-    exit 1
+if [[ -z "$STATE_DIR" ]]; then
+    if [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then
+        STATE_DIR="$SCRIPT_DIR/../state"
+    else
+        STATE_DIR="$SCRIPT_DIR/runtime/state"
+    fi
 fi
-PENDING_DIR="$BASE_DIR/pending"
-RUNNING_DIR="$BASE_DIR/running"
-DONE_DIR="$BASE_DIR/done"
-LOGS_DIR="$BASE_DIR/logs"
-KILL_DIR="$BASE_DIR/kill"
-FIFO_DIR="$BASE_DIR/fifo"
-MAINT_FILE="$BASE_DIR/maintenance"
+LOGS_DIR="${LOGS_DIR:-${STATE_DIR%/state}/logs}"
+PENDING_DIR="$STATE_DIR/pending"
+RUNNING_DIR="$STATE_DIR/running"
+DONE_DIR="$STATE_DIR/done"
+KILL_DIR="$STATE_DIR/kill"
+FIFO_DIR="$STATE_DIR/fifo"
+MAINT_FILE="$STATE_DIR/maintenance"
+UPDATE_LOCK="$STATE_DIR/locks/update-reservation.lock"
 TIMEOUT=600
 LOCK_DEVICE=""
 DEVICE_NUM=""
@@ -89,6 +103,7 @@ task-submit — 提交任务到 root 执行队列
   task-submit --timeout N --wait <task-id>     自定义等待超时(秒，默认 600)
   task-submit --status <task-id>               查看任务状态
   task-submit --log <task-id>                  查看任务日志（已完成或运行中）
+  task-submit --stats [--days N]               查看 NPU 使用统计（默认近 7 天）
 
 管理:
   task-submit --list                           列出所有任务
@@ -181,11 +196,11 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
         --env-file) ENV_FILES+=("$2"); shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
-        --wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--help|-h)
+        --wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--help|-h)
             break ;;
         # 未知选项必须硬失败。此处曾是 `*) break`，会把未识别的 flag 连同其后的
         # --run/--timeout 一起当作任务命令提交，且 RUN_MODE 未置位时静默 exit 0
-        # —— CI 因此看不出测试根本没跑（见 ISSUES.md 的 --ignore-whitelist 事故）。
+        # —— CI 因此看不出测试根本没跑。
         --*)
             echo "${C_RED}错误: 未知选项 '$1'${C_RESET}" >&2
             echo "${C_DIM}如果这是新版本的选项，说明本机 task-submit 过旧，请重新部署${C_RESET}" >&2
@@ -250,7 +265,7 @@ validate_device_pool() {
         exit 1
     fi
     is_auto_device_request || return 0
-    local wl="$BASE_DIR/available_devices"
+    local wl="$STATE_DIR/available_devices"
     [[ -f "$wl" ]] || return 0
     local allow
     allow=$(tr -d '[:space:]' < "$wl" 2>/dev/null)
@@ -418,7 +433,7 @@ apply_device_policy() {
     elif [[ -n "$DEVICE_POOL" ]]; then
         base="$DEVICE_POOL"
     else
-        local wl="$BASE_DIR/available_devices"
+        local wl="$STATE_DIR/available_devices"
         [[ -f "$wl" ]] && base="$(tr -d '[:space:]' < "$wl" 2>/dev/null)"
         if [[ -z "$base" ]]; then
             local n
@@ -456,7 +471,7 @@ validate_device_count() {
 
     # 全局候选：available_devices 文件优先，否则自动探测 /dev/davinci*
     local -a global_arr=()
-    local wl="$BASE_DIR/available_devices" g=""
+    local wl="$STATE_DIR/available_devices" g=""
     [[ -f "$wl" ]] && g="$(tr -d '[:space:]' < "$wl" 2>/dev/null)"
     if [[ -n "$g" ]]; then
         IFS=',' read -ra global_arr <<< "$g"
@@ -552,6 +567,15 @@ check_command() {
 submit_task() {
     local cmd="$1"
 
+    # Submissions share this lock; the updater takes it exclusively from its
+    # final idle check through installation.
+    exec 8>"$UPDATE_LOCK" || {
+        echo "${C_RED}错误: 无法打开更新协调锁${C_RESET}" >&2
+        exit 1
+    }
+    flock -s 8 || exit 1
+    check_maintenance
+
     # 危险命令在提交侧拦截
     if ! check_command "$cmd"; then
         echo "${C_RED}错误: 命令被拒绝（包含危险操作）${C_RESET}" >&2
@@ -576,7 +600,6 @@ submit_task() {
 SUBMIT_USER=$(whoami)
 SUBMIT_TIME=$(date -Iseconds)
 WORK_DIR=$(pwd)
-USER_HOME=$HOME
 COMMAND=$cmd
 DEVICE=$device_request
 DEVICE_AUTO=$(is_auto_device_request && echo 1 || echo 0)
@@ -604,8 +627,9 @@ EOF
     # 收集额外环境变量，追加到 .env 快照
     local env_snapshot="$PENDING_DIR/${task_id}.env"
 
-    # 来源1: ~/.task-env-vars（每行一个变量名）
-    local env_vars_file="$HOME/.task-env-vars"
+    # 来源1: TASKQUEUE_ENV_VARS_FILE（每行一个变量名）。不默认读取用户
+    # home 下的文件，避免运行依赖于某个账户的 HOME 布局。
+    local env_vars_file="${TASKQUEUE_ENV_VARS_FILE:-}"
     if [[ -f "$env_vars_file" ]]; then
         while IFS= read -r varname; do
             [[ -z "$varname" || "$varname" == \#* ]] && continue
@@ -956,7 +980,7 @@ check_maintenance() {
 # 写入/清除后通过 SIGHUP 通知 daemon 重新加载到内存，
 # 运行时零开销（daemon 不会每次分配设备都读文件）。
 notify_daemon_reload() {
-    local pid_file="$BASE_DIR/task-daemon.pid"
+    local pid_file="$STATE_DIR/task-daemon.pid"
     if [[ -f "$pid_file" ]]; then
         local pid
         pid=$(cat "$pid_file" 2>/dev/null)
@@ -968,7 +992,7 @@ notify_daemon_reload() {
 }
 
 devices_cmd() {
-    local devices_file="$BASE_DIR/available_devices"
+    local devices_file="$STATE_DIR/available_devices"
     local action="${1:-status}"
 
     case "$action" in
@@ -1124,9 +1148,52 @@ strip_npu_lock() {
     fi
 }
 
+# 设备占用总览：锁文件由 npu-lock 以 666 权限维护，普通用户无需读取
+# 他人的私有任务元数据，也能准确看到队列当前锁定的卡及其提交用户。
+show_device_occupancy() {
+    local total d p u lf
+    total=$(ls -1 /dev/davinci[0-9]* 2>/dev/null | wc -l)
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+
+    local -A held by_user
+    local occupied=0
+    for ((d = 0; d < total; d++)); do
+        lf="$STATE_DIR/locks/npu_device_${d}.lock"
+        [[ -f "$lf" ]] || continue
+        p=$(grep -oP 'pid=\K[0-9]+' "$lf" 2>/dev/null)
+        # /proc is traversable to all users; unlike kill -0 it does not report
+        # EPERM for a live task owned by another submitter.
+        [[ -n "$p" && -d "/proc/$p" ]] || continue
+        u=$(grep -oP 'user=\K[^ ]+' "$lf" 2>/dev/null)
+        held[$d]="${u:-?}"
+        occupied=$((occupied + 1))
+    done
+
+    echo "${C_BOLD}=== 设备占用 (${occupied}/${total}) ===${C_RESET}"
+    if [[ $occupied -eq 0 ]]; then
+        echo "  ${C_GREEN}全部空闲${C_RESET}"
+    else
+        for d in "${!held[@]}"; do
+            by_user[${held[$d]}]+="$d "
+        done
+        local user cards free=""
+        for user in "${!by_user[@]}"; do
+            cards=$(printf '%s\n' ${by_user[$user]} | sort -n | paste -sd, -)
+            echo "  ${C_RED}占用${C_RESET} [$cards] → $user"
+        done
+        for ((d = 0; d < total; d++)); do
+            [[ -z "${held[$d]:-}" ]] && free+="$d,"
+        done
+        echo "  ${C_GREEN}空闲${C_RESET} [${free%,}]"
+    fi
+    echo ""
+}
+
 # 列出任务（增强版）
 list_tasks() {
     local has_any=false
+
+    show_device_occupancy
 
     # 维护模式横幅
     if [[ -f "$MAINT_FILE" ]]; then
@@ -1139,8 +1206,8 @@ list_tasks() {
 
     # Pending
     local pending_files=("$PENDING_DIR"/task_*)
+    echo "${C_BOLD}=== Pending ===${C_RESET}"
     if [[ -f "${pending_files[0]}" ]]; then
-        echo "${C_BOLD}=== Pending ===${C_RESET}"
         for f in "${pending_files[@]}"; do
             [[ -f "$f" ]] || continue
             [[ "$f" == *.env ]] && continue
@@ -1163,8 +1230,8 @@ list_tasks() {
 
     # Running
     local running_files=("$RUNNING_DIR"/task_*)
+    echo "${C_BOLD}=== Running ===${C_RESET}"
     if [[ -f "${running_files[0]}" ]]; then
-        echo "${C_BOLD}=== Running ===${C_RESET}"
         for f in "${running_files[@]}"; do
             [[ -f "$f" ]] || continue
             has_any=true
@@ -1187,8 +1254,8 @@ list_tasks() {
     # Done (最近 20 个)
     local done_files
     done_files=$(ls -t "$DONE_DIR"/task_* 2>/dev/null | head -20)
+    echo "${C_BOLD}=== Done (recent 20) ===${C_RESET}"
     if [[ -n "$done_files" ]]; then
-        echo "${C_BOLD}=== Done (recent 20) ===${C_RESET}"
         while IFS= read -r f; do
             [[ -f "$f" ]] || continue
             has_any=true
@@ -1282,6 +1349,13 @@ case "${1:-}" in
     --find)
         find_tasks "${2:-}"
         ;;
+    --stats)
+        if [[ -x "$SCRIPT_DIR/pto-task-stats" ]]; then
+            exec "$SCRIPT_DIR/pto-task-stats" "${@:2}"
+        else
+            exec bash "$SCRIPT_DIR/pto-task-stats.sh" "${@:2}"
+        fi
+        ;;
     --help|-h|"")
         usage
         ;;
@@ -1293,7 +1367,6 @@ case "${1:-}" in
             echo "${C_DIM}命令请用引号包裹，例如: task-submit --run \"python train.py\"${C_RESET}" >&2
             exit 1
         fi
-        check_maintenance
         task_id=$(submit_task "$1")
         if [[ "$RUN_MODE" == "true" ]]; then
             echo "${C_DIM}任务已提交: $task_id (断开后可用 task-submit --wait $task_id 重连)${C_RESET}" >&2
