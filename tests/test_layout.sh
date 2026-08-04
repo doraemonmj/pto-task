@@ -34,14 +34,23 @@ grep -Fqx "BIN_DIR=$BIN_DIR" "$INSTALL_ROOT/app/.pto-task-install-options"
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/pto-task-auto-update" "$INSTALL_ROOT/app/pto-task-auto-update.service"
 [[ -d "$INSTALL_ROOT/config" && -d "$INSTALL_ROOT/state" && -d "$INSTALL_ROOT/logs" && -d "$INSTALL_ROOT/tmp" ]]
 grep -q '^TASK_EXECUTION_MODE="HwHiAiUser"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
+grep -q '^PTOAS_BASE="/usr/local/ptoas"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(grep -c '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf")" -eq 1 ]]
 grep -q '^AUTO_UPDATE_BRANCH="main"' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 666 ]]
-[[ -s "$INSTALL_ROOT/app/.pto-task-update-repository" ]]
+grep -Fqx 'https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/app/.pto-task-update-repository"
+grep -Fq 'AUTO_UPDATE_REPOSITORY=https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/config/taskqueue.conf"
 "$BIN_DIR/task-submit" 'true' >/dev/null
 "$BIN_DIR/pto-task" 'true' >/dev/null
 compgen -G "$INSTALL_ROOT/state/pending/task_*" >/dev/null
+
+# Task metadata is shared for queue listings, while environment snapshots stay
+# private, regardless of the submitting user's umask.
+strict_task_id="$(umask 077; "$BIN_DIR/task-submit" 'true')"
+[[ "$(stat -c %a "$INSTALL_ROOT/state/pending/$strict_task_id")" == 644 ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/state/pending/${strict_task_id}.env")" == 600 ]]
+
 exec 9>"$INSTALL_ROOT/state/locks/update-reservation.lock"
 flock -x 9
 if timeout 0.2 "$BIN_DIR/pto-task" 'true' >/dev/null 2>&1; then
@@ -68,6 +77,8 @@ printf 'keep\n' > "$INSTALL_ROOT/state/pending/sentinel"
 bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR"
 grep -qx 'MAX_CONCURRENT=23' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(<"$INSTALL_ROOT/state/pending/sentinel")" == keep ]]
+
+bash "$REPO_DIR/tests/test_ptoas_option.sh"
 
 mkdir -p "$REPO_DIR/runtime/config" "$REPO_DIR/runtime/state/pending" "$REPO_DIR/runtime/state/locks" "$REPO_DIR/runtime/logs" "$REPO_DIR/runtime/tmp"
 install -m 666 /dev/null "$REPO_DIR/runtime/state/locks/update-reservation.lock"
@@ -114,5 +125,7 @@ if bash "$REPO_DIR/tests/test_layout.sh" >/dev/null 2>&1; then
     echo 'error: layout test did not reject an existing source runtime' >&2
     exit 1
 fi
+
+bash "$REPO_DIR/tests/test_auto_update_retry.sh"
 
 echo 'layout tests passed'

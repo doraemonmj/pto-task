@@ -34,6 +34,17 @@ daemon restart.
 Use `task-submit --list` before maintenance. Submit with the existing syntax,
 for example `task-submit --device auto --run "python train.py"`. Use
 `--status`, `--log`, `--wait`, `--cancel`, and `--kill` with a task id.
+Use `--ptoas VERSION` to select `PTOAS_BASE/VERSION`; the client canonicalizes
+the path within the configured root, requires an executable `ptoas` or
+`bin/ptoas`, injects the matching `PTOAS_ROOT`, and prepends the version root
+followed by its `bin` directory to `PATH`. Root-first ordering preserves legacy
+wrappers that configure the matching libraries.
+`PTOAS_BASE` has a server default in `taskqueue.conf` (`/usr/local/ptoas`); an
+explicitly exported submitter value takes precedence for a host with a
+separately installed PTOAS tree.
+Omitting `--ptoas` preserves the submitter's existing `PTOAS_ROOT` and `PATH`.
+A non-empty exported `PTOAS_ROOT` also takes precedence over a conflicting
+`--ptoas`, in which case the client leaves both variables unchanged.
 
 Use `pto-task --stats --days 7` for read-only usage reporting. Sampling is
 independent of the daemon and disabled by default. Set
@@ -62,9 +73,12 @@ installation. `npu_lock.sh` and the daemon remain private app components.
 The automatic-update timer is enabled by default for root installations with
 initialized config. It follows the access-controlled branch configured by
 `AUTO_UPDATE_BRANCH` (default `main`), so repository write and merge access must
-remain restricted. Use `sudo bash setup.sh --disable-auto-update` to opt out. It
-fetches nightly, waits for an idle queue, updates only `app/`, and never restarts
-the daemon. Keep Git/SSH credentials outside configuration and logs.
+remain restricted. Use `sudo bash setup.sh --disable-auto-update` to opt out.
+The official `pypto-tools/npu-taskqueue` repository is the default;
+administrators may override `AUTO_UPDATE_REPOSITORY` in installed config. The
+updater retries twice at five-minute intervals after a fetch failure, then waits
+for an idle queue, updates only `app/`, and never restarts the daemon. Keep
+Git/SSH credentials outside configuration and logs.
 
 ## Source mode
 

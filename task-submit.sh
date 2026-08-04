@@ -25,9 +25,18 @@ else
 fi
 STATE_DIR=""
 LOGS_DIR=""
+# The installed config provides the server default, while an explicitly
+# exported submitter value takes precedence for hosts with another PTOAS tree.
+SUBMITTER_PTOAS_BASE="${PTOAS_BASE:-}"
+unset PTOAS_BASE
+PTOAS_BASE="/usr/local/ptoas"
 if [ -f "$CONF_FILE" ]; then
     source "$CONF_FILE"
 fi
+if [[ -n "$SUBMITTER_PTOAS_BASE" ]]; then
+    export PTOAS_BASE="$SUBMITTER_PTOAS_BASE"
+fi
+unset SUBMITTER_PTOAS_BASE
 if [[ -z "$STATE_DIR" ]]; then
     if [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" ]]; then
         STATE_DIR="$SCRIPT_DIR/../state"
@@ -52,6 +61,7 @@ MAX_TIME=300    # 任务最大执行时间（秒），0=不限
 INTERACTIVE=false # --interactive 交互式模式
 EXTRA_ENVS=()    # --env 收集的额外环境变量
 ENV_FILES=()     # --env-file 收集的环境变量文件
+PTOAS_VERSION=""
 # 卡组：限定 --device auto 的自动分配范围，来源为环境变量 TASKQUEUE_DEVICE_POOL
 # （与全局白名单 available_devices 取交集，白名单为硬上限）
 DEVICE_POOL="${TASKQUEUE_DEVICE_POOL:-}"
@@ -131,6 +141,7 @@ task-submit — 提交任务到 root 执行队列
   --env VAR       捕获当前 shell 的环境变量（可重复使用）
   --env VAR=VAL   传递指定值的环境变量
   --env-file FILE 从文件读取环境变量（支持 KEY=VAL / export KEY=VAL）
+  --ptoas VERSION 从 PTOAS_BASE 选择版本；已有 PTOAS_ROOT 时以环境为准
   --max-time N    任务最大执行时间(秒，默认 300，0=不限)
 
 示例:
@@ -152,6 +163,9 @@ task-submit — 提交任务到 root 执行队列
 
   # 传递自定义环境变量
   task-submit --device auto --env WANDB_PROJECT --env SEED=42 --run "python train.py"
+
+  # 指定 PTOAS 版本
+  task-submit --ptoas 0.54 --device auto --run "python train.py"
 
   # 交互式任务（可在执行过程中输入 prompt）
   task-submit -i --device auto --run "python interactive_train.py"
@@ -194,6 +208,12 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
         --days)    CLEAN_DAYS="$2"; shift 2 ;;
         --env)     EXTRA_ENVS+=("$2"); shift 2 ;;
         --env-file) ENV_FILES+=("$2"); shift 2 ;;
+        --ptoas)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo "${C_RED}错误: --ptoas 需要版本号（例如 0.54）${C_RESET}" >&2
+                exit 1
+            fi
+            PTOAS_VERSION="$2"; shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
         --wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--help|-h)
@@ -563,6 +583,57 @@ check_command() {
     return 0
 }
 
+canonical_ptoas_dir() {
+    local candidate="$1" base_real candidate_real
+    base_real="$(readlink -e -- "$PTOAS_BASE" 2>/dev/null)" || return 1
+    candidate_real="$(readlink -e -- "$candidate" 2>/dev/null)" || return 1
+    case "$candidate_real" in
+        "$base_real"/*) ;;
+        *) return 1 ;;
+    esac
+    [[ -x "$candidate_real/ptoas" || -x "$candidate_real/bin/ptoas" ]] || return 1
+    printf '%s\n' "$candidate_real"
+}
+
+list_ptoas_versions() {
+    [[ -d "$PTOAS_BASE" ]] || return 0
+    local d version
+    for d in "$PTOAS_BASE"/*/; do
+        version="${d%/}"
+        version="${version##*/}"
+        [[ "$version" =~ ^[0-9]+([.][0-9]+)*$ ]] || continue
+        canonical_ptoas_dir "$d" >/dev/null || continue
+        echo "$version"
+    done | sort -V
+}
+
+resolve_ptoas() {
+    [[ -z "$PTOAS_VERSION" ]] && return 0
+    if [[ -n "${PTOAS_ROOT:-}" ]]; then
+        echo "${C_YELLOW}提示: 已设置 PTOAS_ROOT=$PTOAS_ROOT，忽略 --ptoas $PTOAS_VERSION${C_RESET}" >&2
+        return 0
+    fi
+    if [[ ! "$PTOAS_VERSION" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+        echo "${C_RED}错误: PTOAS 版本必须是数字版本号（例如 0.54）${C_RESET}" >&2
+        exit 1
+    fi
+
+    local requested_dir="$PTOAS_BASE/$PTOAS_VERSION"
+    local ptoas_dir
+    if ! ptoas_dir="$(canonical_ptoas_dir "$requested_dir")"; then
+        echo "${C_RED}错误: 未找到可用的 PTOAS 版本 '$PTOAS_VERSION'（需要 $requested_dir/ptoas 或 bin/ptoas）${C_RESET}" >&2
+        local available
+        available="$(list_ptoas_versions | paste -sd, -)"
+        echo "${C_DIM}可用版本: ${available:-（无）}${C_RESET}" >&2
+        exit 1
+    fi
+
+    EXTRA_ENVS+=("PTOAS_ROOT=$ptoas_dir")
+    # 旧版在版本根目录提供包装脚本，由它注入对应 lib/；新版把入口放在
+    # bin/。根目录优先、bin/ 兜底可同时兼容两种安装布局。
+    EXTRA_ENVS+=("PATH=$ptoas_dir:$ptoas_dir/bin:$PATH")
+}
+
 # 提交任务
 submit_task() {
     local cmd="$1"
@@ -595,8 +666,10 @@ submit_task() {
 
     local task_id="task_$(date +%Y%m%d_%H%M%S)_${$}${RANDOM}"
     local task_file="$PENDING_DIR/$task_id"
+    local task_file_tmp="$PENDING_DIR/.${task_id}.task.tmp"
+    local env_snapshot="$PENDING_DIR/.${task_id}.env.tmp"
 
-    cat > "$task_file" <<EOF
+    cat > "$task_file_tmp" <<EOF
 SUBMIT_USER=$(whoami)
 SUBMIT_TIME=$(date -Iseconds)
 WORK_DIR=$(pwd)
@@ -611,21 +684,29 @@ EOF
         echo "${C_RED}错误: 无法写入任务文件${C_RESET}" >&2
         exit 1
     fi
+    # 任务元数据需要被所有队列用户读取（例如 task-submit --list），不能继承
+    # 提交用户可能设置的严格 umask。
+    chmod 644 "$task_file_tmp" || {
+        rm -f "$task_file_tmp"
+        echo "${C_RED}错误: 无法设置任务文件权限${C_RESET}" >&2
+        exit 1
+    }
 
     # 自动快照用户完整环境（黑名单过滤危险/无意义变量）
-    env -0 | while IFS= read -r -d '' line; do
-        local key="${line%%=*}"
-        case "$key" in
-            BASH_*|BASHOPTS|SHELLOPTS|SHELL|SHLVL|_|OLDPWD|PWD) continue ;;
-            SSH_*|DISPLAY|TERM|TERMINAL|XDG_*|DBUS_*|WINDOWID|COLORTERM) continue ;;
-            LD_PRELOAD|TASKQUEUE_INSIDE) continue ;;
-            ASCEND_RT_VISIBLE_DEVICES) continue ;;  # 由 auto 分配管理，不透传用户侧设置
-        esac
-        printf '%s\0' "$line"
-    done > "$PENDING_DIR/${task_id}.env"
-
-    # 收集额外环境变量，追加到 .env 快照
-    local env_snapshot="$PENDING_DIR/${task_id}.env"
+    # 环境快照可能含敏感信息，始终以 600 创建，不能依赖提交用户的 umask。
+    (
+        umask 077
+        env -0 | while IFS= read -r -d '' line; do
+            local key="${line%%=*}"
+            case "$key" in
+                BASH_*|BASHOPTS|SHELLOPTS|SHELL|SHLVL|_|OLDPWD|PWD) continue ;;
+                SSH_*|DISPLAY|TERM|TERMINAL|XDG_*|DBUS_*|WINDOWID|COLORTERM) continue ;;
+                LD_PRELOAD|TASKQUEUE_INSIDE) continue ;;
+                ASCEND_RT_VISIBLE_DEVICES) continue ;;  # 由 auto 分配管理，不透传用户侧设置
+            esac
+            printf '%s\0' "$line"
+        done > "$env_snapshot"
+    )
 
     # 来源1: TASKQUEUE_ENV_VARS_FILE（每行一个变量名）。不默认读取用户
     # home 下的文件，避免运行依赖于某个账户的 HOME 布局。
@@ -671,6 +752,14 @@ EOF
             fi
         done < "$envfile"
     done
+
+    # 先发布私有环境快照，最后原子发布 task_* 文件；daemon 只会看到完整任务，
+    # 不会在环境快照尚未写完时提前接管。
+    if ! mv "$env_snapshot" "$PENDING_DIR/${task_id}.env" || ! mv "$task_file_tmp" "$task_file"; then
+        rm -f "$env_snapshot" "$task_file_tmp" "$PENDING_DIR/${task_id}.env"
+        echo "${C_RED}错误: 无法发布任务文件${C_RESET}" >&2
+        exit 1
+    fi
 
     echo "$task_id"
 }
@@ -1367,6 +1456,7 @@ case "${1:-}" in
             echo "${C_DIM}命令请用引号包裹，例如: task-submit --run \"python train.py\"${C_RESET}" >&2
             exit 1
         fi
+        resolve_ptoas
         task_id=$(submit_task "$1")
         if [[ "$RUN_MODE" == "true" ]]; then
             echo "${C_DIM}任务已提交: $task_id (断开后可用 task-submit --wait $task_id 重连)${C_RESET}" >&2

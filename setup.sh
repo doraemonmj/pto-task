@@ -48,10 +48,7 @@ STATE_DIR="$TOOL_ROOT/state"
 LOGS_DIR="$TOOL_ROOT/logs"
 TMP_DIR="$TOOL_ROOT/tmp"
 CONFIG_FILE="$CONFIG_DIR/taskqueue.conf"
-SOURCE_UPDATE_REPOSITORY="$(git -C "$SCRIPT_DIR" config --get remote.origin.url 2>/dev/null || true)"
-# Never copy embedded HTTP credentials into config or app files. SSH remotes do
-# not contain a secret and continue to use the host's normal SSH credentials.
-SOURCE_UPDATE_REPOSITORY="$(printf '%s' "$SOURCE_UPDATE_REPOSITORY" | sed -E 's#^(https?://)[^/@]+@#\1#')"
+SOURCE_UPDATE_REPOSITORY="https://github.com/pypto-tools/npu-taskqueue.git"
 
 # Reinstalling copies only code. Create missing directories on first install,
 # but do not even change modes of existing config or state directories.
@@ -120,7 +117,7 @@ if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
         sed -n '/^MAX_CONCURRENT=/,$p' "$SCRIPT_DIR/config/default.conf" |
             sed '/^AUTO_UPDATE_REPOSITORY=/d'
         if [[ -n "$SOURCE_UPDATE_REPOSITORY" ]]; then
-            printf 'AUTO_UPDATE_REPOSITORY=%q # 自动更新远端（由安装时 Git origin 自动识别）\n' "$SOURCE_UPDATE_REPOSITORY"
+            printf 'AUTO_UPDATE_REPOSITORY=%q # 自动更新远端（官方仓库）\n' "$SOURCE_UPDATE_REPOSITORY"
         fi
     } > "$CONFIG_FILE"
     # Clients source this non-secret queue configuration before submitting a

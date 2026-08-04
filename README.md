@@ -51,6 +51,7 @@ Every option and argument pattern is retained.
 ```bash
 task-submit --device auto --run "python train.py"
 task-submit --device auto --device-num 2 --run "python train.py --devices 0,1"
+task-submit --ptoas 0.54 --device auto --run "python train.py"
 pto-task --device 3 --run "python train.py --device 3"
 task-submit --run "pytest tests/"
 task-submit --list
@@ -65,6 +66,16 @@ pto-task --stats --days 7
 `--max-time` defaults to 300 seconds; `--timeout` defaults to 600 seconds and
 only controls client waiting. Project-local `task-submit.conf` device policies
 and the existing `TASKQUEUE_DEVICE_*` environment controls continue to work.
+`--ptoas VERSION` validates `PTOAS_BASE/VERSION`, sets `PTOAS_ROOT`, and
+prepends both the version root and its `bin` directory to the submitted `PATH`.
+The root takes precedence so legacy wrapper scripts can configure their
+matching libraries. `PTOAS_BASE` is a
+server-side default (`/usr/local/ptoas`) that a submitter may explicitly
+override in their environment for a host with a separately installed tree.
+Without `--ptoas`, the submitter's existing `PTOAS_ROOT` and `PATH` are
+preserved unchanged. A non-empty exported `PTOAS_ROOT` also takes precedence
+over a conflicting `--ptoas` option, leaving both `PTOAS_ROOT` and `PATH`
+unchanged for that task.
 
 ## Configuration and security
 
@@ -77,6 +88,7 @@ credentials in it. The software does not store or print credentials.
 | `MAX_CONCURRENT` | `10` | Maximum simultaneously running jobs |
 | `MAX_TIME_HARD_CAP` | `0` | Server maximum task duration; `0` means unlimited |
 | `KILL_GRACE` | `5` | Seconds from SIGTERM to SIGKILL |
+| `PTOAS_BASE` | `/usr/local/ptoas` | Default root containing installed PTOAS versions; submitter environment takes precedence |
 | `TASK_EXECUTION_MODE` | `HwHiAiUser` | Task identity: submitter with NPU group, or `root` |
 | `AVAILABLE_DEVICES` | empty | Comma-separated automatic device pool; empty detects devices |
 
@@ -133,12 +145,14 @@ Git and deployed installations.
 ## Automatic updates
 
 The automatic-update timer is enabled by default for a root installation with
-initialized configuration. The installer records the source repository's Git
-`origin` after removing embedded HTTP credentials. It follows the configured,
+initialized configuration. New installations default to the official
+`pypto-tools/npu-taskqueue` repository regardless of which development checkout
+runs the installer. Administrators may override `AUTO_UPDATE_REPOSITORY` in the
+installed configuration; the updater follows that repository's configured,
 access-controlled branch:
 
 ```bash
-AUTO_UPDATE_REPOSITORY="git@github.com:pypto-tools/npu-taskqueue.git"
+AUTO_UPDATE_REPOSITORY="https://github.com/pypto-tools/npu-taskqueue.git"
 AUTO_UPDATE_BRANCH="main"
 ```
 
@@ -149,8 +163,9 @@ selected branch's `setup.sh` as root. To opt out of installing the timer:
 sudo bash setup.sh --disable-auto-update
 ```
 
-The timer starts at 03:17 daily. It fetches first into `tmp/`, then takes an
-exclusive update reservation and waits up to
+The timer starts at 03:17 daily. A failed repository fetch is retried twice at
+five-minute intervals. After a successful fetch into `tmp/`, the updater takes
+an exclusive update reservation and waits up to
 six hours for both `state/pending` and `state/running` to be empty, checking
 every five minutes. It updates only `app/`, preserves `config/` and `state/`,
 and never restarts the daemon; the update is recorded in `logs/auto-update.log`.

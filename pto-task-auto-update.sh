@@ -29,6 +29,8 @@ fi
 UPDATE_BRANCH="${AUTO_UPDATE_BRANCH:-main}"
 IDLE_WAIT_SECONDS="${AUTO_UPDATE_IDLE_WAIT_SECONDS:-21600}"
 IDLE_RETRY_SECONDS="${AUTO_UPDATE_IDLE_RETRY_SECONDS:-300}"
+FETCH_ATTEMPTS=3
+FETCH_RETRY_SECONDS=300
 
 mkdir -p "$LOGS_DIR" "$TMP_DIR"
 LOG_FILE="$LOGS_DIR/auto-update.log"
@@ -45,12 +47,24 @@ fi
 
 checkout="$(mktemp -d "$TMP_DIR/auto-update.XXXXXX")"
 trap 'rm -rf "$checkout"' EXIT
-if ! git clone --depth 1 --branch "$UPDATE_BRANCH" "$UPDATE_REPOSITORY" "$checkout/repo" >/dev/null 2>&1; then
-    log 'update check failed: unable to fetch repository'
+checkout_repo=""
+for ((attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++)); do
+    candidate="$checkout/repo-$attempt"
+    if git clone --depth 1 --branch "$UPDATE_BRANCH" "$UPDATE_REPOSITORY" "$candidate" >/dev/null 2>&1; then
+        checkout_repo="$candidate"
+        break
+    fi
+    if (( attempt < FETCH_ATTEMPTS )); then
+        log "update check attempt ${attempt}/${FETCH_ATTEMPTS} failed; retrying in ${FETCH_RETRY_SECONDS}s"
+        sleep "$FETCH_RETRY_SECONDS"
+    fi
+done
+if [[ -z "$checkout_repo" ]]; then
+    log "update check failed after ${FETCH_ATTEMPTS} attempts: unable to fetch repository"
     exit 1
 fi
 
-remote_revision="$(git -C "$checkout/repo" rev-parse HEAD)"
+remote_revision="$(git -C "$checkout_repo" rev-parse HEAD)"
 installed_revision="$(cat "$APP_DIR/.pto-task-release" 2>/dev/null || true)"
 if [[ "$remote_revision" == "$installed_revision" ]]; then
     log 'no update available'
@@ -94,7 +108,7 @@ SBIN_DIR=/usr/local/sbin
 if [[ -f "$APP_DIR/.pto-task-install-options" ]]; then
     source "$APP_DIR/.pto-task-install-options"
 fi
-if bash "$checkout/repo/setup.sh" --tools-root "$(dirname "$TOOL_ROOT")" \
+if bash "$checkout_repo/setup.sh" --tools-root "$(dirname "$TOOL_ROOT")" \
     --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR" >/dev/null 2>&1; then
     log "updated app to revision ${remote_revision:0:12}; daemon was not restarted"
 else
