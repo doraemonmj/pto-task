@@ -865,6 +865,9 @@ while $RUNNING; do
             log "skip $task_id (already taken)"
             continue
         fi
+        # 兼容尚未升级的客户端：严格 umask 创建的任务可能是 600，导致其他
+        # 用户执行 task-submit --list 时无法读取 running 元数据。
+        chmod 644 "$RUNNING_DIR/$task_id" 2>/dev/null || log "warning: cannot normalize permissions for $task_id"
         # 同时迁移环境快照文件
         [ -f "$PENDING_DIR/${task_id}.env" ] && mv "$PENDING_DIR/${task_id}.env" "$RUNNING_DIR/${task_id}.env" 2>/dev/null
 

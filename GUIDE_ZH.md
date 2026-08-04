@@ -16,6 +16,9 @@ task-submit --device 9 --run "python train.py -d 9"
 # 多卡
 task-submit --device auto --device-num 2 --run "python train.py --devices 0,1"
 
+# 指定 PTOAS 版本；自动设置 PTOAS_ROOT，并依次把版本根目录和 bin 放到 PATH 前面
+task-submit --ptoas 0.54 --device auto --run "python train.py"
+
 # 非 NPU 任务 —— 不写 --device 就不分配卡
 task-submit --run "make build"
 task-submit --run "pytest tests/test_foo.py"
@@ -29,6 +32,14 @@ task-submit --device auto --max-time 0 --timeout 0 --run "python train.py"
 # 交互式任务（执行过程中可以从终端输入）
 task-submit -i --device auto --run "python interactive_script.py"
 ```
+
+未指定 `--ptoas` 时保留提交者已有的 `PTOAS_ROOT` 和 `PATH`，不自动切换版本。
+指定版本必须在服务器配置项 `PTOAS_BASE` 下包含可执行的 `ptoas` 或 `bin/ptoas`；
+版本根目录优先，以便旧版包装脚本自动加载对应的 `lib/`。当前默认
+根目录为 `/usr/local/ptoas`。管理员可在 `taskqueue.conf` 中为服务器单独配置；
+提交用户显式导出的 `PTOAS_BASE` 优先级更高。
+如果已经导出了非空的 `PTOAS_ROOT`，它的优先级也高于冲突的 `--ptoas` 参数，
+此时任务会保留原有的 `PTOAS_ROOT` 和 `PATH`。
 
 ### 怎么把卡号告诉你的程序
 
