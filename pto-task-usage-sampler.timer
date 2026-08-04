@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically sample PTO Task NPU usage
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=pto-task-usage-sampler.service
+
+[Install]
+WantedBy=timers.target

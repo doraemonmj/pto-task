@@ -2,9 +2,12 @@
 *.bak
 *.bak.*
 
-# 受限用户真实名单含内部账号名，不入库；用 conf/restricted-users.example 占位
-conf/restricted-users
+# 当前服务器的私有配置。
+config/local.conf
 
-# 本地问题跟踪：含未修复漏洞的利用细节，本仓是公开仓库，不入库
-# 规则见 .claude/rules/problem-handling.md
+# Source-tree runtime.  It is created locally when running the scripts from
+# this checkout and must never be deployed or committed.
+runtime/
+
+# 本地问题跟踪：含未修复漏洞的利用细节，不入库
 KNOWN_ISSUES.md
