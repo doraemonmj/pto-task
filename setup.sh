@@ -195,7 +195,7 @@ ensure_dir() {
 }
 
 prepare_state_layout() {
-    local state_dir="$1" lock_file
+    local state_dir="$1" lock_file unsafe_lock
     [[ "$state_dir" == /* && "$state_dir" != / ]] || {
         echo "error: STATE_DIR must be an absolute directory other than /" >&2
         exit 1
@@ -211,12 +211,17 @@ prepare_state_layout() {
     chmod 1777 "$state_dir/pending" "$state_dir/locks" "$state_dir/kill" "$state_dir/fifo"
 
     lock_file="$state_dir/locks/update-reservation.lock"
-    if [[ -L "$lock_file" ]]; then
-        echo "error: update reservation lock must not be a symlink" >&2
-        exit 1
-    fi
     if [[ ! -e "$lock_file" ]]; then
+        [[ ! -L "$lock_file" ]] || {
+            echo "error: update reservation lock must not be a symlink" >&2
+            exit 1
+        }
         install -m 666 /dev/null "$lock_file"
+    fi
+    if [[ -L "$lock_file" || ! -f "$lock_file" ||
+          "$(stat -c %h "$lock_file" 2>/dev/null || true)" != 1 ]]; then
+        echo "error: update reservation lock must be a regular file with one link" >&2
+        exit 1
     fi
     chmod 666 "$lock_file"
     if [[ "$(id -u)" -eq 0 ]]; then
@@ -225,11 +230,18 @@ prepare_state_layout() {
 
     # Device locks are intentionally persistent. Older versions could leave a
     # user-owned 0600/0644 file behind, preventing the next submitter from
-    # opening the same device lock. Symlinks are deliberately excluded.
-    find "$state_dir/locks" -maxdepth 1 -type f -name 'npu_device_*.lock' \
+    # opening the same device lock. Refuse links instead of changing metadata
+    # through an attacker-controlled name.
+    unsafe_lock="$(find "$state_dir/locks" -maxdepth 1 -name 'npu_device_*.lock' \
+        ! \( -type f -links 1 \) -print -quit)"
+    if [[ -n "$unsafe_lock" ]]; then
+        echo "error: device lock must be a regular file with one link: $unsafe_lock" >&2
+        exit 1
+    fi
+    find "$state_dir/locks" -maxdepth 1 -type f -links 1 -name 'npu_device_*.lock' \
         -exec chmod 666 {} +
     if [[ "$(id -u)" -eq 0 ]]; then
-        find "$state_dir/locks" -maxdepth 1 -type f -name 'npu_device_*.lock' \
+        find "$state_dir/locks" -maxdepth 1 -type f -links 1 -name 'npu_device_*.lock' \
             -exec chown root:root {} +
     fi
 }
@@ -252,12 +264,17 @@ precreate_device_locks() {
             exit 2
         }
         lock_file="$state_dir/locks/npu_device_${id}.lock"
-        [[ ! -L "$lock_file" ]] || {
-            echo "error: device lock must not be a symlink: $lock_file" >&2
-            exit 1
-        }
         if [[ ! -e "$lock_file" ]]; then
+            [[ ! -L "$lock_file" ]] || {
+                echo "error: device lock must not be a symlink: $lock_file" >&2
+                exit 1
+            }
             install -m 666 /dev/null "$lock_file"
+        fi
+        if [[ -L "$lock_file" || ! -f "$lock_file" ||
+              "$(stat -c %h "$lock_file" 2>/dev/null || true)" != 1 ]]; then
+            echo "error: device lock must be a regular file with one link: $lock_file" >&2
+            exit 1
         fi
         chmod 666 "$lock_file"
         if [[ "$(id -u)" -eq 0 ]]; then

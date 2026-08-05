@@ -244,15 +244,25 @@ fi
 lock_fds=()
 for dev in "${need_lock[@]}"; do
     lock_file="${LOCK_DIR}/npu_device_${dev}.lock"
-    if [[ -L "$lock_file" ]]; then
-        echo "${C_RED}[npu-lock] 错误: 锁文件不能是符号链接: $lock_file${C_RESET}" >&2
+
+    # Create missing locks with noclobber (O_CREAT|O_EXCL), then verify that
+    # the descriptor we open is still the same single-link regular file. Bash
+    # has no O_NOFOLLOW redirection flag, so all later metadata and holder
+    # writes go through the verified descriptor instead of resolving the path.
+    if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+        (umask 000; set -o noclobber; : > "$lock_file") 2>/dev/null || true
+    fi
+    if [[ -L "$lock_file" || ! -f "$lock_file" ||
+          "$(stat -c %h "$lock_file" 2>/dev/null || true)" != 1 ]]; then
+        echo "${C_RED}[npu-lock] 错误: 锁文件必须是单链接普通文件: $lock_file${C_RESET}" >&2
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
         exit 1
     fi
+    path_identity="$(stat -c '%d:%i' "$lock_file" 2>/dev/null || true)"
 
-    # O_CREAT applies the mode after umask atomically. This removes the window
-    # where another user could observe a newly-created 0600 lock before a
-    # follow-up chmod. Append mode also avoids truncating the holder metadata
-    # before this process has actually acquired flock.
+    # Append mode avoids truncating holder metadata before flock is acquired.
     previous_umask=$(umask)
     umask 000
     exec {fd}>>"$lock_file"
@@ -266,7 +276,29 @@ for dev in "${need_lock[@]}"; do
         done
         exit 1
     fi
-    chmod 666 "$lock_file" 2>/dev/null || true
+    fd_identity="$(stat -Lc '%d:%i' "/proc/self/fd/$fd" 2>/dev/null || true)"
+    current_identity="$(stat -c '%d:%i' "$lock_file" 2>/dev/null || true)"
+    fd_link_count="$(stat -Lc %h "/proc/self/fd/$fd" 2>/dev/null || true)"
+    current_link_count="$(stat -c %h "$lock_file" 2>/dev/null || true)"
+    if [[ -z "$path_identity" || "$fd_identity" != "$path_identity" ||
+          "$current_identity" != "$path_identity" || "$fd_link_count" != 1 ||
+          "$current_link_count" != 1 || ! -f "/proc/self/fd/$fd" ||
+          ! -f "$lock_file" || -L "$lock_file" ]]; then
+        echo "${C_RED}[npu-lock] 错误: 打开锁文件期间路径发生变化: $lock_file${C_RESET}" >&2
+        exec {fd}>&-
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
+    if ! chmod 666 "/proc/self/fd/$fd" 2>/dev/null; then
+        echo "${C_RED}[npu-lock] 错误: 无法修复共享锁权限: $lock_file${C_RESET}" >&2
+        exec {fd}>&-
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
 
     if [[ $timeout -eq 0 ]]; then
         echo "${C_DIM}[npu-lock] 获取设备 ${dev} 的锁 (无超时)...${C_RESET}" >&2

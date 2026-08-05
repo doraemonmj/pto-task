@@ -41,7 +41,7 @@ for shared_dir in pending locks kill fifo; do
     [[ -d "$INSTALL_ROOT/state/$shared_dir" ]]
     [[ "$(stat -c %a "$INSTALL_ROOT/state/$shared_dir")" == 1777 ]]
 done
-for private_dir in running done usage; do
+for private_dir in running 'done' usage; do
     [[ -d "$INSTALL_ROOT/state/$private_dir" ]]
     [[ "$(stat -c %a "$INSTALL_ROOT/state/$private_dir")" == 755 ]]
 done
@@ -122,6 +122,19 @@ grep -qx 'MAX_CONCURRENT=23' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks")" == 1777 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/npu_device_30.lock")" == 666 ]]
 
+# A deployment must reject hard-linked lock names without changing the linked
+# target's metadata.
+hardlink_target="$TEST_ROOT/hardlink-target"
+install -m 600 /dev/null "$hardlink_target"
+ln "$hardlink_target" "$INSTALL_ROOT/state/locks/npu_device_29.lock"
+if bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" \
+    --sbin-dir "$SBIN_DIR" >/dev/null 2>&1; then
+    echo 'error: setup accepted a hard-linked device lock' >&2
+    exit 1
+fi
+[[ "$(stat -c %a "$hardlink_target")" == 600 ]]
+rm -f "$INSTALL_ROOT/state/locks/npu_device_29.lock" "$hardlink_target"
+
 # Explicit deployment options update only their named keys.
 bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR" \
     --max-concurrent 7 --max-time-hard-cap 900 --available-devices 0,2,4 \
@@ -193,6 +206,29 @@ TASKQUEUE_CONF="$TEST_ROOT/evil.conf" \
 [[ -e "$TEST_ROOT/trusted-locks/locks/npu_device_0.lock" ]]
 [[ ! -e "$TEST_ROOT/evil-locks/locks/npu_device_0.lock" ]]
 
+# Lock opening must reject indirection without mutating the target.
+printf 'unchanged\n' > "$TEST_ROOT/symlink-target"
+chmod 600 "$TEST_ROOT/symlink-target"
+ln -s "$TEST_ROOT/symlink-target" "$TEST_ROOT/trusted-locks/locks/npu_device_1.lock"
+if TASKQUEUE_LOCK_STATE_DIR="$TEST_ROOT/trusted-locks" \
+    bash "$REPO_DIR/npu_lock.sh" 1 --timeout 0 -- true >/dev/null 2>&1; then
+    echo 'error: npu lock accepted a symlink' >&2
+    exit 1
+fi
+[[ "$(<"$TEST_ROOT/symlink-target")" == unchanged ]]
+[[ "$(stat -c %a "$TEST_ROOT/symlink-target")" == 600 ]]
+
+printf 'unchanged-hardlink\n' > "$TEST_ROOT/runtime-hardlink-target"
+chmod 600 "$TEST_ROOT/runtime-hardlink-target"
+ln "$TEST_ROOT/runtime-hardlink-target" "$TEST_ROOT/trusted-locks/locks/npu_device_2.lock"
+if TASKQUEUE_LOCK_STATE_DIR="$TEST_ROOT/trusted-locks" \
+    bash "$REPO_DIR/npu_lock.sh" 2 --timeout 0 -- true >/dev/null 2>&1; then
+    echo 'error: npu lock accepted a hard link' >&2
+    exit 1
+fi
+[[ "$(<"$TEST_ROOT/runtime-hardlink-target")" == unchanged-hardlink ]]
+[[ "$(stat -c %a "$TEST_ROOT/runtime-hardlink-target")" == 600 ]]
+
 # Invalid or disabled timeout values must fall back to a finite deadline.
 mkdir -p "$TEST_ROOT/fake-bin" "$REPO_DIR/runtime/state/running" "$REPO_DIR/runtime/state/usage"
 cat >> "$REPO_DIR/runtime/config/taskqueue.conf" <<EOF
@@ -220,5 +256,6 @@ if bash "$REPO_DIR/tests/test_layout.sh" >/dev/null 2>&1; then
 fi
 
 bash "$REPO_DIR/tests/test_auto_update_retry.sh"
+bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
 
 echo 'layout tests passed'

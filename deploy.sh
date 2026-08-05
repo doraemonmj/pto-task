@@ -22,6 +22,8 @@ done
 CONFIG_FILE="${TOOLS_ROOT%/}/pto-task/config/taskqueue.conf"
 maintenance_file=""
 deployment_set_maintenance=false
+upgrade_guard_active=false
+reservation_fd=""
 
 cleanup() {
     if [[ "$deployment_set_maintenance" == true && -n "$maintenance_file" ]]; then
@@ -29,6 +31,29 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+start_upgrade_guard() {
+    local reservation_lock
+    state_dir="$1"
+    maintenance_file="$state_dir/maintenance"
+    if [[ ! -e "$maintenance_file" ]]; then
+        printf '%s\n' 'deploying pto-task update' > "$maintenance_file"
+        deployment_set_maintenance=true
+    fi
+
+    reservation_lock="$state_dir/locks/update-reservation.lock"
+    if [[ -L "$reservation_lock" || ! -f "$reservation_lock" ||
+          "$(stat -c %h "$reservation_lock" 2>/dev/null || true)" != 1 ]]; then
+        echo "error: unsafe or missing update reservation lock: $reservation_lock" >&2
+        exit 1
+    fi
+    exec {reservation_fd}>>"$reservation_lock"
+    if ! flock -x -w 60 "$reservation_fd"; then
+        echo 'error: could not take the update reservation lock; another update may be running' >&2
+        exit 1
+    fi
+    upgrade_guard_active=true
+}
 
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "error: deployment requires root; run: sudo bash deploy.sh" >&2
@@ -40,6 +65,15 @@ fi
 daemon_was_active=false
 if systemctl is-active --quiet pto-task.service || systemctl is-active --quiet taskqueue.service; then
     daemon_was_active=true
+fi
+
+# On a normal update, block submissions and concurrent automatic updates before
+# replacing any application files. A legacy active install may not have the new
+# config yet; that case takes the same guard immediately after migration setup.
+if [[ "$daemon_was_active" == true && -f "$CONFIG_FILE" ]]; then
+    state_dir="$(bash -c 'source "$1"; printf "%s" "${STATE_DIR:-${BASE_DIR:-}}"' _ "$CONFIG_FILE")"
+    [[ -n "$state_dir" ]] || state_dir="${TOOLS_ROOT%/}/pto-task/state"
+    start_upgrade_guard "$state_dir"
 fi
 
 # setup.sh initializes only a missing config and preserves an existing one.
@@ -55,14 +89,11 @@ systemctl enable pto-task.service
 # The daemon's TERM handler kills its children, so an upgrade restart is only
 # safe after maintenance mode has stopped new submissions and running/ is empty.
 if [[ "$daemon_was_active" == true ]]; then
-    state_dir="$(bash -c 'source "$1"; printf "%s" "${STATE_DIR:-${BASE_DIR:-}}"' _ "$CONFIG_FILE")"
-    [[ -n "$state_dir" ]] || state_dir="${TOOLS_ROOT%/}/pto-task/state"
-    maintenance_file="$state_dir/maintenance"
-    if [[ ! -e "$maintenance_file" ]]; then
-        printf '%s\n' 'deploying pto-task update' > "$maintenance_file"
-        deployment_set_maintenance=true
+    if [[ "$upgrade_guard_active" == false ]]; then
+        state_dir="$(bash -c 'source "$1"; printf "%s" "${STATE_DIR:-${BASE_DIR:-}}"' _ "$CONFIG_FILE")"
+        [[ -n "$state_dir" ]] || state_dir="${TOOLS_ROOT%/}/pto-task/state"
+        start_upgrade_guard "$state_dir"
     fi
-    sleep 1
     running_task="$(find "$state_dir/running" -maxdepth 1 -type f ! -name '*.env' -print -quit 2>/dev/null || true)"
     if [[ -n "$running_task" ]]; then
         echo 'Application files were updated, but the daemon was not restarted because a task is running.' >&2
@@ -80,6 +111,9 @@ if [[ "$daemon_was_active" == true ]]; then
     systemctl restart pto-task.service
     cleanup
     deployment_set_maintenance=false
+    exec {reservation_fd}>&-
+    reservation_fd=""
+    upgrade_guard_active=false
 else
     echo 'Starting pto-task.service...'
     systemctl start pto-task.service

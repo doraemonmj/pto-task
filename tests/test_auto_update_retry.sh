@@ -25,6 +25,7 @@ AUTO_UPDATE_REPOSITORY="mock://repository"
 AUTO_UPDATE_BRANCH="main"
 # Simulate an existing server that still carries the former six-hour value.
 AUTO_UPDATE_IDLE_WAIT_SECONDS=21600
+AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=21600
 LOCAL_SENTINEL="keep-me"
 EOF
 printf '%s\n' 'installed-revision' > "$APP_DIR/.pto-task-release"
@@ -119,6 +120,7 @@ config_after="$(sha256sum "$CONFIG_DIR/taskqueue.conf")"
 [[ -s "$TEST_ROOT/install-call" ]]
 grep -Fq 'update check attempt 1/3 failed; retrying in 300s' "$LOGS_DIR/auto-update.log"
 grep -Fq 'update check attempt 2/3 failed; retrying in 300s' "$LOGS_DIR/auto-update.log"
+grep -Fq 'idle wait maximum capped from 21600s to 7200s' "$LOGS_DIR/auto-update.log"
 grep -Fq 'idle wait capped from 21600s to 7200s' "$LOGS_DIR/auto-update.log"
 grep -Fq 'updated app to revision remote-revis; daemon restarted' "$LOGS_DIR/auto-update.log"
 grep -Fq 'LOCAL_SENTINEL="keep-me"' "$CONFIG_DIR/taskqueue.conf"
@@ -167,8 +169,11 @@ fi
 [[ -e "$APP_DIR/.pto-task-activation-retry" ]]
 grep -Fq 'daemon restart failed; activation will be retried' "$LOGS_DIR/auto-update.log"
 
+rm -f "$TEST_ROOT/systemctl-calls" "$TEST_ROOT/restarted"
 SYSTEMCTL_INACTIVE=true RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" \
     PATH="$FAKE_BIN:$PATH" /usr/bin/bash "$APP_DIR/pto-task-auto-update"
+grep -Fq 'restart pto-task.service' "$TEST_ROOT/systemctl-calls"
+[[ -e "$TEST_ROOT/restarted" ]]
 [[ ! -e "$APP_DIR/.pto-task-restart-required" ]]
 [[ ! -e "$APP_DIR/.pto-task-activation-retry" ]]
 
