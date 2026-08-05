@@ -23,6 +23,8 @@ LOGS_DIR="$LOGS_DIR"
 TMP_DIR="$TMP_DIR"
 AUTO_UPDATE_REPOSITORY="mock://repository"
 AUTO_UPDATE_BRANCH="main"
+# Simulate an existing server that still carries the former six-hour value.
+AUTO_UPDATE_IDLE_WAIT_SECONDS=21600
 LOCAL_SENTINEL="keep-me"
 EOF
 printf '%s\n' 'installed-revision' > "$APP_DIR/.pto-task-release"
@@ -76,14 +78,36 @@ cat > "$FAKE_BIN/bash" <<'EOF'
 #!/usr/bin/bash
 if [[ "${1:-}" == */setup.sh ]]; then
     printf '%s\n' "$*" > "$RETRY_TEST_ROOT/install-call"
+    printf '%s\n' 'remote-revision' > "$RETRY_APP_DIR/.pto-task-release"
+    touch "$RETRY_APP_DIR/.pto-task-restart-required"
     exit 0
 fi
 exec /usr/bin/bash "$@"
 EOF
+
+cat > "$FAKE_BIN/systemctl" <<'EOF'
+#!/usr/bin/bash
+printf '%s\n' "$*" >> "$RETRY_TEST_ROOT/systemctl-calls"
+case "${1:-}" in
+    is-active)
+        [[ "${SYSTEMCTL_INACTIVE:-false}" != true || -e "$RETRY_TEST_ROOT/restarted" ]]
+        exit $?
+        ;;
+    stop) exit 0 ;;
+    restart)
+        if [[ "${SYSTEMCTL_RESTART_FAIL:-false}" == true ]]; then
+            exit 1
+        fi
+        touch "$RETRY_TEST_ROOT/restarted"
+        exit 0
+        ;;
+esac
+exit 0
+EOF
 chmod 755 "$FAKE_BIN"/*
 
 config_before="$(sha256sum "$CONFIG_DIR/taskqueue.conf")"
-RETRY_TEST_ROOT="$TEST_ROOT" PATH="$FAKE_BIN:$PATH" \
+RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" PATH="$FAKE_BIN:$PATH" \
     /usr/bin/bash "$APP_DIR/pto-task-auto-update"
 config_after="$(sha256sum "$CONFIG_DIR/taskqueue.conf")"
 
@@ -95,10 +119,16 @@ config_after="$(sha256sum "$CONFIG_DIR/taskqueue.conf")"
 [[ -s "$TEST_ROOT/install-call" ]]
 grep -Fq 'update check attempt 1/3 failed; retrying in 300s' "$LOGS_DIR/auto-update.log"
 grep -Fq 'update check attempt 2/3 failed; retrying in 300s' "$LOGS_DIR/auto-update.log"
-grep -Fq 'updated app to revision remote-revis; daemon was not restarted' "$LOGS_DIR/auto-update.log"
+grep -Fq 'idle wait capped from 21600s to 7200s' "$LOGS_DIR/auto-update.log"
+grep -Fq 'updated app to revision remote-revis; daemon restarted' "$LOGS_DIR/auto-update.log"
 grep -Fq 'LOCAL_SENTINEL="keep-me"' "$CONFIG_DIR/taskqueue.conf"
+grep -Fq -- '--non-interactive' "$TEST_ROOT/install-call"
+grep -Fq 'restart pto-task.service' "$TEST_ROOT/systemctl-calls"
+[[ ! -e "$APP_DIR/.pto-task-restart-required" ]]
+[[ ! -e "$APP_DIR/.pto-task-activation-retry" ]]
 
-rm -f "$TEST_ROOT/attempts" "$TEST_ROOT/sleeps" "$TEST_ROOT/install-call"
+rm -f "$TEST_ROOT/attempts" "$TEST_ROOT/sleeps" "$TEST_ROOT/install-call" \
+    "$TEST_ROOT/systemctl-calls"
 if RETRY_FAIL_FOREVER=true RETRY_TEST_ROOT="$TEST_ROOT" PATH="$FAKE_BIN:$PATH" \
     /usr/bin/bash "$APP_DIR/pto-task-auto-update"; then
     echo 'error: updater succeeded after every clone attempt failed' >&2
@@ -110,5 +140,36 @@ fi
 grep -Fq 'update check failed after 3 attempts: unable to fetch repository' \
     "$LOGS_DIR/auto-update.log"
 [[ "$config_before" == "$(sha256sum "$CONFIG_DIR/taskqueue.conf")" ]]
+
+# A setup performed by an older updater leaves a restart marker. Even when the
+# installed revision already matches remote, the new updater must activate it.
+touch "$APP_DIR/.pto-task-restart-required"
+rm -f "$TEST_ROOT/install-call" "$TEST_ROOT/systemctl-calls"
+RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" PATH="$FAKE_BIN:$PATH" \
+    /usr/bin/bash "$APP_DIR/pto-task-auto-update"
+[[ ! -e "$TEST_ROOT/install-call" ]]
+grep -Fq 'restart pto-task.service' "$TEST_ROOT/systemctl-calls"
+grep -Fq 'activated installed revision remote-revis; daemon restarted' \
+    "$LOGS_DIR/auto-update.log"
+[[ ! -e "$APP_DIR/.pto-task-restart-required" ]]
+
+# If activation fails after stopping the old daemon, keep both markers. A later
+# run retries activation even when systemctl now reports the daemon inactive.
+touch "$APP_DIR/.pto-task-restart-required"
+rm -f "$TEST_ROOT/systemctl-calls" "$TEST_ROOT/restarted"
+if SYSTEMCTL_RESTART_FAIL=true RETRY_TEST_ROOT="$TEST_ROOT" \
+    RETRY_APP_DIR="$APP_DIR" PATH="$FAKE_BIN:$PATH" \
+    /usr/bin/bash "$APP_DIR/pto-task-auto-update"; then
+    echo 'error: updater succeeded after daemon restart failed' >&2
+    exit 1
+fi
+[[ -e "$APP_DIR/.pto-task-restart-required" ]]
+[[ -e "$APP_DIR/.pto-task-activation-retry" ]]
+grep -Fq 'daemon restart failed; activation will be retried' "$LOGS_DIR/auto-update.log"
+
+SYSTEMCTL_INACTIVE=true RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" \
+    PATH="$FAKE_BIN:$PATH" /usr/bin/bash "$APP_DIR/pto-task-auto-update"
+[[ ! -e "$APP_DIR/.pto-task-restart-required" ]]
+[[ ! -e "$APP_DIR/.pto-task-activation-retry" ]]
 
 echo 'auto-update retry tests passed'

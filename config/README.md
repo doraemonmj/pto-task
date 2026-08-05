@@ -1,6 +1,6 @@
 # Installed configuration
 
-The installer creates this file only with `--init-config`:
+The installer creates this file automatically when it is missing:
 
 ```text
 /home/pypto-tools/pto-task/config/taskqueue.conf

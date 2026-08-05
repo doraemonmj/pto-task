@@ -10,7 +10,7 @@ else
     CONF_FILE="$SCRIPT_DIR/runtime/config/taskqueue.conf"
 fi
 if [ ! -f "$CONF_FILE" ]; then
-    echo "error: $CONF_FILE not found; install with setup.sh --init-config or set TASKQUEUE_CONF" >&2
+    echo "error: $CONF_FILE not found; run setup.sh or set TASKQUEUE_CONF" >&2
     exit 1
 fi
 if [[ "$(id -u)" -ne 0 ]]; then

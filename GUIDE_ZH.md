@@ -4,6 +4,58 @@
 
 共享 NPU 机器的任务队列。提交你的命令，系统给你分一张卡并锁住，不用再和别人抢。
 
+## 管理员部署
+
+首次安装和后续手动升级都只需一条命令；它会初始化但不覆盖已有配置，完成
+systemd 重载、启动/安全重启、开机自启和状态验证：
+
+```bash
+sudo bash deploy.sh
+```
+
+在交互式终端首次执行时，部署脚本会询问本机 NPU 卡数量和最大并发数；直接
+回车即可接受自动检测/推荐值。无人值守部署可加 `--non-interactive`，也可以用
+`--available-devices` 和 `--max-concurrent` 直接指定而不回答问题。
+
+部署时会一次性创建完整运行目录，不依赖首个用户在使用过程中临时创建：
+
+```text
+/home/pypto-tools/pto-task/
+├── app/
+├── config/
+├── state/{pending,running,done,locks,kill,fifo,usage}/
+├── logs/
+└── tmp/
+```
+
+重复部署会保留配置和队列数据，同时校正 `pending/`、`locks/`、`kill/`、
+`fifo/` 等多用户共享目录及已有设备锁的权限。部署会按照最终卡列表预先创建
+每张卡的持久锁文件，后续任务只打开并复用同一个锁，不再由首个用户创建。
+
+常用配置可以直接随部署命令传入，不必手改配置文件：
+
+```bash
+sudo bash deploy.sh --max-concurrent 8 --available-devices 0,1,2,3 \
+  --ptoas-base /usr/local/ptoas --task-execution-mode HwHiAiUser
+```
+
+升级时若仍有任务运行，脚本不会杀任务，只更新程序文件并提示任务结束后重新执行。
+旧版 `/etc/taskqueue.conf` 中安全的 `BASE_DIR` 和 `MAX_CONCURRENT` 会自动迁移，
+`taskqueue.service` 也保留为 `pto-task.service` 的兼容名称。
+
+自动更新会先阻止新任务提交，等待 pending 和 running 都为空后再安装并安全重启
+正在运行的 daemon。重启失败会保留待激活标记，在下次定时更新时继续重试；原本
+处于停止状态的 daemon 不会被自动启动。
+
+定时器固定在北京时间（`Asia/Shanghai`）每天凌晨 03:17，使用服务器经 NTP
+同步后的系统时钟，不受服务器本地时区影响。若服务器夜间关机，白天启动时不会
+补跑错过的更新。等待队列空闲的单次上限为 2 小时，每 5 分钟检查一次；新版的
+2 小时硬上限也会限制仍保存旧版 6 小时配置的服务器。
+
+从旧版（自动更新从不重启 daemon）迁移时，第一次定时运行会安装新版并留下待激活
+标记，下一次定时运行完成激活；如果希望发布后立即生效，在已有服务器上手动执行
+一次 `sudo bash deploy.sh` 即可。
+
 ## 提交
 
 ```bash

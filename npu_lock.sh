@@ -244,9 +244,29 @@ fi
 lock_fds=()
 for dev in "${need_lock[@]}"; do
     lock_file="${LOCK_DIR}/npu_device_${dev}.lock"
-    touch "$lock_file" 2>/dev/null
-    chmod 666 "$lock_file" 2>/dev/null
-    exec {fd}>"$lock_file"
+    if [[ -L "$lock_file" ]]; then
+        echo "${C_RED}[npu-lock] 错误: 锁文件不能是符号链接: $lock_file${C_RESET}" >&2
+        exit 1
+    fi
+
+    # O_CREAT applies the mode after umask atomically. This removes the window
+    # where another user could observe a newly-created 0600 lock before a
+    # follow-up chmod. Append mode also avoids truncating the holder metadata
+    # before this process has actually acquired flock.
+    previous_umask=$(umask)
+    umask 000
+    exec {fd}>>"$lock_file"
+    open_rc=$?
+    umask "$previous_umask"
+    if (( open_rc != 0 )); then
+        echo "${C_RED}[npu-lock] 错误: 无法打开共享锁 $lock_file${C_RESET}" >&2
+        echo "${C_DIM}[npu-lock] 请管理员重新执行 sudo bash deploy.sh 修复历史锁权限${C_RESET}" >&2
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
+    chmod 666 "$lock_file" 2>/dev/null || true
 
     if [[ $timeout -eq 0 ]]; then
         echo "${C_DIM}[npu-lock] 获取设备 ${dev} 的锁 (无超时)...${C_RESET}" >&2
@@ -266,7 +286,10 @@ for dev in "${need_lock[@]}"; do
         fi
     fi
 
-    echo "pid=$$ user=$(whoami) time=$(date -Iseconds)" >&"$fd"
+    # Replace stale metadata only after flock succeeds. /proc/self/fd keeps the
+    # write tied to the inode we locked instead of resolving the path again.
+    printf 'pid=%s user=%s time=%s\n' "$$" "$(whoami)" "$(date -Iseconds)" \
+        > "/proc/self/fd/$fd"
     echo "${C_GREEN}[npu-lock] 已获取设备 ${dev} 的锁 (pid=$$)${C_RESET}" >&2
     lock_fds+=("$fd")
 done
