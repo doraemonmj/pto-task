@@ -53,6 +53,9 @@ grep -q '^AUTO_UPDATE_BRANCH="main"' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_IDLE_WAIT_SECONDS=7200' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 666 ]]
+if [[ "$(id -u)" -eq 0 ]]; then
+    [[ "$(stat -c %u "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 0 ]]
+fi
 grep -Fqx 'https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/app/.pto-task-update-repository"
 grep -Fq 'AUTO_UPDATE_REPOSITORY=https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/config/taskqueue.conf"
 "$BIN_DIR/task-submit" 'true' >/dev/null
@@ -116,11 +119,16 @@ printf 'keep\n' > "$INSTALL_ROOT/state/pending/sentinel"
 # Re-deployment repairs historical shared-directory and lock-file modes.
 chmod 755 "$INSTALL_ROOT/state/locks"
 install -m 600 /dev/null "$INSTALL_ROOT/state/locks/npu_device_30.lock"
+historical_lock_inode="$(stat -c '%d:%i' "$INSTALL_ROOT/state/locks/npu_device_30.lock")"
 bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR"
 grep -qx 'MAX_CONCURRENT=23' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(<"$INSTALL_ROOT/state/pending/sentinel")" == keep ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks")" == 1777 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/npu_device_30.lock")" == 666 ]]
+[[ "$(stat -c '%d:%i' "$INSTALL_ROOT/state/locks/npu_device_30.lock")" == "$historical_lock_inode" ]]
+if [[ "$(id -u)" -eq 0 ]]; then
+    [[ "$(stat -c %u "$INSTALL_ROOT/state/locks/npu_device_30.lock")" == 0 ]]
+fi
 
 # A deployment must reject hard-linked lock names without changing the linked
 # target's metadata.
@@ -134,6 +142,22 @@ if bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" \
 fi
 [[ "$(stat -c %a "$hardlink_target")" == 600 ]]
 rm -f "$INSTALL_ROOT/state/locks/npu_device_29.lock" "$hardlink_target"
+
+# The update-reservation path uses the same no-follow descriptor helper.
+reservation_lock="$INSTALL_ROOT/state/locks/update-reservation.lock"
+mv "$reservation_lock" "$TEST_ROOT/update-reservation.saved"
+printf 'reservation-target\n' > "$TEST_ROOT/reservation-target"
+chmod 600 "$TEST_ROOT/reservation-target"
+ln -s "$TEST_ROOT/reservation-target" "$reservation_lock"
+if bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" \
+    --sbin-dir "$SBIN_DIR" >/dev/null 2>&1; then
+    echo 'error: setup accepted a symlinked update-reservation lock' >&2
+    exit 1
+fi
+[[ "$(<"$TEST_ROOT/reservation-target")" == reservation-target ]]
+[[ "$(stat -c %a "$TEST_ROOT/reservation-target")" == 600 ]]
+rm -f "$reservation_lock" "$TEST_ROOT/reservation-target"
+mv "$TEST_ROOT/update-reservation.saved" "$reservation_lock"
 
 # Explicit deployment options update only their named keys.
 bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR" \

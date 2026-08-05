@@ -194,8 +194,84 @@ ensure_dir() {
     [[ -d "$dir" ]] || install -d -m "$mode" "$dir"
 }
 
+# Open lock files without following the final path component, validate the
+# opened inode, and change metadata through that descriptor. This keeps a
+# lower-trust owner of a historical lock entry from redirecting root chmod or
+# chown while setup is repairing a mode-1777 lock directory. Existing inodes
+# are never replaced or truncated, so active flock users remain synchronized.
+repair_lock_metadata() {
+    local root_owner=false
+    (( $# > 0 )) || return 0
+    command -v python3 >/dev/null 2>&1 || {
+        echo "error: python3 is required for safe lock-file setup" >&2
+        exit 1
+    }
+    [[ "$(id -u)" -ne 0 ]] || root_owner=true
+    python3 -I - "$root_owner" "$@" <<'PY'
+import os
+import stat
+import sys
+
+
+def fail(path, message):
+    print(f"error: unsafe lock file {path}: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+root_owner = sys.argv[1] == "true"
+if not hasattr(os, "O_NOFOLLOW"):
+    fail("<platform>", "O_NOFOLLOW is unavailable")
+
+flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW
+flags |= getattr(os, "O_CLOEXEC", 0)
+old_umask = os.umask(0)
+try:
+    for path in sys.argv[2:]:
+        parent, name = os.path.split(path)
+        if not parent or not name or name in (".", ".."):
+            fail(path, "invalid path")
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        dir_flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            dir_fd = os.open(parent, dir_flags)
+        except OSError as exc:
+            fail(path, f"cannot open lock directory: {exc.strerror}")
+        try:
+            try:
+                fd = os.open(name, flags, 0o666, dir_fd=dir_fd)
+            except OSError as exc:
+                fail(path, f"cannot open without following links: {exc.strerror}")
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                    fail(path, "must be a regular file with one link")
+                try:
+                    current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError as exc:
+                    fail(path, f"cannot verify opened path: {exc.strerror}")
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    fail(path, "path changed while opening")
+                if root_owner:
+                    os.fchown(fd, 0, 0)
+                os.fchmod(fd, 0o666)
+                try:
+                    current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError as exc:
+                    fail(path, f"cannot verify repaired path: {exc.strerror}")
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    fail(path, "path changed while repairing metadata")
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dir_fd)
+finally:
+    os.umask(old_umask)
+PY
+}
+
 prepare_state_layout() {
-    local state_dir="$1" lock_file unsafe_lock
+    local state_dir="$1" lock_file
+    local -a device_lock_files=()
     [[ "$state_dir" == /* && "$state_dir" != / ]] || {
         echo "error: STATE_DIR must be an absolute directory other than /" >&2
         exit 1
@@ -211,39 +287,16 @@ prepare_state_layout() {
     chmod 1777 "$state_dir/pending" "$state_dir/locks" "$state_dir/kill" "$state_dir/fifo"
 
     lock_file="$state_dir/locks/update-reservation.lock"
-    if [[ ! -e "$lock_file" ]]; then
-        [[ ! -L "$lock_file" ]] || {
-            echo "error: update reservation lock must not be a symlink" >&2
-            exit 1
-        }
-        install -m 666 /dev/null "$lock_file"
-    fi
-    if [[ -L "$lock_file" || ! -f "$lock_file" ||
-          "$(stat -c %h "$lock_file" 2>/dev/null || true)" != 1 ]]; then
-        echo "error: update reservation lock must be a regular file with one link" >&2
-        exit 1
-    fi
-    chmod 666 "$lock_file"
-    if [[ "$(id -u)" -eq 0 ]]; then
-        chown root:root "$lock_file"
-    fi
+    repair_lock_metadata "$lock_file"
 
     # Device locks are intentionally persistent. Older versions could leave a
     # user-owned 0600/0644 file behind, preventing the next submitter from
-    # opening the same device lock. Refuse links instead of changing metadata
-    # through an attacker-controlled name.
-    unsafe_lock="$(find "$state_dir/locks" -maxdepth 1 -name 'npu_device_*.lock' \
-        ! \( -type f -links 1 \) -print -quit)"
-    if [[ -n "$unsafe_lock" ]]; then
-        echo "error: device lock must be a regular file with one link: $unsafe_lock" >&2
-        exit 1
-    fi
-    find "$state_dir/locks" -maxdepth 1 -type f -links 1 -name 'npu_device_*.lock' \
-        -exec chmod 666 {} +
-    if [[ "$(id -u)" -eq 0 ]]; then
-        find "$state_dir/locks" -maxdepth 1 -type f -links 1 -name 'npu_device_*.lock' \
-            -exec chown root:root {} +
-    fi
+    # opening the same device lock. The descriptor helper rejects links and
+    # other unsafe entries before changing any metadata.
+    mapfile -d '' -t device_lock_files < <(
+        find "$state_dir/locks" -maxdepth 1 -name 'npu_device_*.lock' -print0
+    )
+    repair_lock_metadata "${device_lock_files[@]}"
 }
 
 precreate_device_locks() {
@@ -264,22 +317,7 @@ precreate_device_locks() {
             exit 2
         }
         lock_file="$state_dir/locks/npu_device_${id}.lock"
-        if [[ ! -e "$lock_file" ]]; then
-            [[ ! -L "$lock_file" ]] || {
-                echo "error: device lock must not be a symlink: $lock_file" >&2
-                exit 1
-            }
-            install -m 666 /dev/null "$lock_file"
-        fi
-        if [[ -L "$lock_file" || ! -f "$lock_file" ||
-              "$(stat -c %h "$lock_file" 2>/dev/null || true)" != 1 ]]; then
-            echo "error: device lock must be a regular file with one link: $lock_file" >&2
-            exit 1
-        fi
-        chmod 666 "$lock_file"
-        if [[ "$(id -u)" -eq 0 ]]; then
-            chown root:root "$lock_file"
-        fi
+        repair_lock_metadata "$lock_file"
     done
 }
 
