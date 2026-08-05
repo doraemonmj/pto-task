@@ -15,3 +15,4 @@ ProtectHome=no
 
 [Install]
 WantedBy=multi-user.target
+Alias=taskqueue.service

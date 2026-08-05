@@ -8,12 +8,35 @@ existing users, and `pto-task` is the pypto-tools entry point.
 ## Install and update
 
 ```bash
-# First install: creates the application layout and an initial local config.
-sudo bash setup.sh --init-config
+# First install or manual update: install, activate, and verify everything.
+sudo bash deploy.sh
 
-# Update code only. Config and all queue state are preserved.
+# Install code/configuration links without starting or restarting the daemon.
 sudo bash setup.sh
 ```
+
+`deploy.sh` replaces the former manual `daemon-reload`, config initialization,
+service start, status, and `task-submit --list` sequence. It enables the daemon
+at boot and keeps `taskqueue.service` as an alias of `pto-task.service`. During
+an upgrade it restarts the daemon only when no task is running; otherwise it
+updates the files, leaves the running task untouched, and asks you to rerun the
+same command after the queue drains.
+
+The initial configuration is created automatically. Common host settings can
+be supplied without editing a file:
+
+```bash
+sudo bash deploy.sh --max-concurrent 8 --available-devices 0,1,2,3 \
+  --ptoas-base /usr/local/ptoas --task-execution-mode HwHiAiUser
+```
+
+On a first install from an interactive terminal, the installer prompts for the
+NPU card count and maximum concurrency; Enter accepts the detected/recommended
+value. Use `--non-interactive` for unattended provisioning. Explicit command
+line options always take precedence.
+
+On migration, a safe root-owned `/etc/taskqueue.conf` is detected automatically;
+its legacy `BASE_DIR` queue state and `MAX_CONCURRENT` value are retained.
 
 The default installation is:
 
@@ -21,22 +44,29 @@ The default installation is:
 /home/pypto-tools/pto-task/
 ├── app/       # deployed programs: task-submit, task-daemon, npu_lock.sh
 ├── config/    # local taskqueue.conf; never overwritten by an update
-├── state/     # pending, running, done, locks, FIFO and daemon state
+├── state/     # pending, running, done, locks, FIFO, usage and daemon state
 ├── logs/      # task and daemon logs
 └── tmp/       # temporary files
 ```
 
+Deployment creates this complete tree up front. Re-running it preserves local
+configuration and queue data while repairing the required sticky permissions
+on shared state directories and the modes of existing device lock files. It
+also pre-creates one persistent, root-owned lock per configured/detected device;
+tasks reuse those files instead of creating them on first use.
+
 Use `--tools-root DIR` to install below another root, for example
-`sudo bash setup.sh --tools-root /srv/pypto-tools --init-config`. Installation
-must be run as root from an administrator-reviewed checkout. It copies files
-and creates missing directories, but does not start, restart, or signal the
-task daemon. `/home/pypto-tools` is the default tools root.
+`sudo bash deploy.sh --tools-root /srv/pypto-tools`. Deployment must be run as
+root from an administrator-reviewed checkout. `/home/pypto-tools` is the
+default tools root. Use `setup.sh` instead when only copying files and installing
+system integration without starting or restarting the main daemon is desired.
 
 `/usr/local/bin/task-submit` and `/usr/local/bin/pto-task` are symbolic links
 to the same `<tools-root>/pto-task/app/task-submit` program. No
 `npu-lock` or daemon command alias is installed in `/usr/local/bin`.
 
-Start the private daemon separately when the host is ready:
+The one-command deployment manages the systemd service. For diagnostics, the
+private daemon can also be run directly when systemd is intentionally not used:
 
 ```bash
 TOOLS_ROOT=/home/pypto-tools  # or the value passed to --tools-root
@@ -163,12 +193,25 @@ selected branch's `setup.sh` as root. To opt out of installing the timer:
 sudo bash setup.sh --disable-auto-update
 ```
 
-The timer starts at 03:17 daily. A failed repository fetch is retried twice at
-five-minute intervals. After a successful fetch into `tmp/`, the updater takes
-an exclusive update reservation and waits up to
-six hours for both `state/pending` and `state/running` to be empty, checking
-every five minutes. It updates only `app/`, preserves `config/` and `state/`,
-and never restarts the daemon; the update is recorded in `logs/auto-update.log`.
+The timer starts daily at 03:17 `Asia/Shanghai` (Beijing time), independent of
+the server's local timezone. It uses the host's NTP-synchronized system clock
+and does not replay a missed nighttime run after a daytime boot. A failed
+repository fetch is retried twice at five-minute intervals. After a successful
+fetch into `tmp/`, the updater takes an exclusive update reservation and waits
+up to two hours for both `state/pending` and `state/running` to be empty,
+checking every five minutes. `AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200` also caps
+older installed configurations that still contain the former six-hour value.
+It updates only `app/`, preserves `config/` and `state/`,
+then safely restarts an active daemon before allowing new submissions. A
+persistent activation marker is cleared only after restart succeeds, so a
+failed restart is retried by the next timer run. An intentionally inactive
+daemon is not started automatically. The result is recorded in
+`logs/auto-update.log`.
+
+When upgrading from a release whose updater never restarted the daemon, the
+first timer run installs this release and leaves the activation marker; the
+next timer run activates it. Run `sudo bash deploy.sh` once on existing hosts
+after publishing when immediate activation is preferred.
 For private repositories, configure host Git/SSH credentials outside this
 configuration file; never put tokens or passwords in it.
 

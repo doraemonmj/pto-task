@@ -1,5 +1,5 @@
 [Unit]
-Description=PTO Task idle-only automatic updater
+Description=PTO Task idle-only automatic updater and activator
 
 [Service]
 Type=oneshot

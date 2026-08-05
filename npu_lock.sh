@@ -244,9 +244,61 @@ fi
 lock_fds=()
 for dev in "${need_lock[@]}"; do
     lock_file="${LOCK_DIR}/npu_device_${dev}.lock"
-    touch "$lock_file" 2>/dev/null
-    chmod 666 "$lock_file" 2>/dev/null
-    exec {fd}>"$lock_file"
+
+    # Create missing locks with noclobber (O_CREAT|O_EXCL), then verify that
+    # the descriptor we open is still the same single-link regular file. Bash
+    # has no O_NOFOLLOW redirection flag, so all later metadata and holder
+    # writes go through the verified descriptor instead of resolving the path.
+    if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+        (umask 000; set -o noclobber; : > "$lock_file") 2>/dev/null || true
+    fi
+    if [[ -L "$lock_file" || ! -f "$lock_file" ||
+          "$(stat -c %h "$lock_file" 2>/dev/null || true)" != 1 ]]; then
+        echo "${C_RED}[npu-lock] 错误: 锁文件必须是单链接普通文件: $lock_file${C_RESET}" >&2
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
+    path_identity="$(stat -c '%d:%i' "$lock_file" 2>/dev/null || true)"
+
+    # Append mode avoids truncating holder metadata before flock is acquired.
+    previous_umask=$(umask)
+    umask 000
+    exec {fd}>>"$lock_file"
+    open_rc=$?
+    umask "$previous_umask"
+    if (( open_rc != 0 )); then
+        echo "${C_RED}[npu-lock] 错误: 无法打开共享锁 $lock_file${C_RESET}" >&2
+        echo "${C_DIM}[npu-lock] 请管理员重新执行 sudo bash deploy.sh 修复历史锁权限${C_RESET}" >&2
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
+    fd_identity="$(stat -Lc '%d:%i' "/proc/self/fd/$fd" 2>/dev/null || true)"
+    current_identity="$(stat -c '%d:%i' "$lock_file" 2>/dev/null || true)"
+    fd_link_count="$(stat -Lc %h "/proc/self/fd/$fd" 2>/dev/null || true)"
+    current_link_count="$(stat -c %h "$lock_file" 2>/dev/null || true)"
+    if [[ -z "$path_identity" || "$fd_identity" != "$path_identity" ||
+          "$current_identity" != "$path_identity" || "$fd_link_count" != 1 ||
+          "$current_link_count" != 1 || ! -f "/proc/self/fd/$fd" ||
+          ! -f "$lock_file" || -L "$lock_file" ]]; then
+        echo "${C_RED}[npu-lock] 错误: 打开锁文件期间路径发生变化: $lock_file${C_RESET}" >&2
+        exec {fd}>&-
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
+    if ! chmod 666 "/proc/self/fd/$fd" 2>/dev/null; then
+        echo "${C_RED}[npu-lock] 错误: 无法修复共享锁权限: $lock_file${C_RESET}" >&2
+        exec {fd}>&-
+        for prev_fd in "${lock_fds[@]}"; do
+            exec {prev_fd}>&-
+        done
+        exit 1
+    fi
 
     if [[ $timeout -eq 0 ]]; then
         echo "${C_DIM}[npu-lock] 获取设备 ${dev} 的锁 (无超时)...${C_RESET}" >&2
@@ -266,7 +318,10 @@ for dev in "${need_lock[@]}"; do
         fi
     fi
 
-    echo "pid=$$ user=$(whoami) time=$(date -Iseconds)" >&"$fd"
+    # Replace stale metadata only after flock succeeds. /proc/self/fd keeps the
+    # write tied to the inode we locked instead of resolving the path again.
+    printf 'pid=%s user=%s time=%s\n' "$$" "$(whoami)" "$(date -Iseconds)" \
+        > "/proc/self/fd/$fd"
     echo "${C_GREEN}[npu-lock] 已获取设备 ${dev} 的锁 (pid=$$)${C_RESET}" >&2
     lock_fds+=("$fd")
 done

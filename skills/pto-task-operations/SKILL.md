@@ -52,17 +52,24 @@ independent of the daemon and disabled by default. Set
 rerun `sudo bash setup.sh` to install and enable its timer. The task daemon does
 not need a restart.
 
-Start the daemon only when explicitly requested, using `<root>/app/task-daemon`.
-Starting it requires root; normal `task-submit`/`pto-task` client commands stay
-unprivileged. The installer intentionally does not start or restart the daemon.
+Start the daemon only when explicitly requested. `deploy.sh` is the explicit
+one-command install/update-and-activate entry point; `setup.sh` intentionally
+does not start or restart the daemon. Starting it requires root; normal
+`task-submit`/`pto-task` client commands stay unprivileged.
 
 ## Install or update
 
 Run installation and updates as root from an administrator-reviewed checkout.
 
-First install: `sudo bash setup.sh --init-config`.
+First install or manual activated update: `sudo bash deploy.sh`.
 
-Update code only: `sudo bash setup.sh`.
+Install code only, without daemon activation: `sudo bash setup.sh`.
+
+The configuration is initialized automatically when missing. Common settings
+can be supplied with `--max-concurrent`, `--max-time-hard-cap`,
+`--available-devices`, `--task-execution-mode`, and `--ptoas-base`. Existing
+configuration and state remain preserved except for keys explicitly selected
+by these options. A safe legacy `/etc/taskqueue.conf` is migrated automatically.
 
 Use `--tools-root DIR` when a non-default root is explicitly required. Confirm
 that both public commands resolve to `<root>/app/task-submit` after
@@ -77,8 +84,11 @@ remain restricted. Use `sudo bash setup.sh --disable-auto-update` to opt out.
 The official `pypto-tools/npu-taskqueue` repository is the default;
 administrators may override `AUTO_UPDATE_REPOSITORY` in installed config. The
 updater retries twice at five-minute intervals after a fetch failure, then waits
-for an idle queue, updates only `app/`, and never restarts the daemon. Keep
-Git/SSH credentials outside configuration and logs.
+for an idle queue, updates only `app/`, and safely restarts an active daemon.
+Failed activation remains marked for retry; an intentionally inactive daemon is
+not started. The timer runs at 03:17 Asia/Shanghai using the host's synchronized
+clock, does not replay missed runs during daytime, and caps idle waiting at two
+hours. Keep Git/SSH credentials outside configuration and logs.
 
 ## Source mode
 
