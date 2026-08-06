@@ -51,9 +51,11 @@ The default installation is:
 
 Deployment creates this complete tree up front. Re-running it preserves local
 configuration and queue data while repairing the required sticky permissions
-on shared state directories and the modes of existing device lock files. It
-also pre-creates one persistent, root-owned lock per configured/detected device;
-tasks reuse those files instead of creating them on first use.
+on shared state directories. Administrative directories and persistent lock
+files are normalized to `root:root`; shared directories use mode `1777` and
+device locks use mode `0666`, so every local user can submit work without owning
+or changing a lock file. Deployment pre-creates one lock per configured/detected
+device, and tasks reuse those files instead of creating them on first use.
 
 Use `--tools-root DIR` to install below another root, for example
 `sudo bash deploy.sh --tools-root /srv/pypto-tools`. Deployment must be run as
@@ -83,6 +85,7 @@ task-submit --device auto --run "python train.py"
 task-submit --device auto --device-num 2 --run "python train.py --devices 0,1"
 task-submit --ptoas 0.54 --device auto --run "python train.py"
 pto-task --device 3 --run "python train.py --device 3"
+pto-task --version
 task-submit --run "pytest tests/"
 task-submit --list
 pto-task --status <task-id>
@@ -190,8 +193,11 @@ Restrict repository write and merge access because the updater executes the
 selected branch's `setup.sh` as root. To opt out of installing the timer:
 
 ```bash
-sudo bash setup.sh --disable-auto-update
+sudo bash deploy.sh --disable-auto-update
 ```
+
+Pass `--disable-auto-update` on later manual deployments too; an ordinary
+deployment enables and verifies the timer by default.
 
 The timer starts daily at 03:17 `Asia/Shanghai` (Beijing time), independent of
 the server's local timezone. It uses the host's NTP-synchronized system clock
@@ -206,7 +212,12 @@ then safely restarts an active daemon before allowing new submissions. A
 persistent activation marker is cleared only after restart succeeds, so a
 failed restart is retried by the next timer run. An intentionally inactive
 daemon is not started automatically. The result is recorded in
-`logs/auto-update.log`.
+`logs/auto-update.log`, including installer output and exit status on failure.
+The installed Git revision is recorded in `app/.pto-task-release` only after
+the requested systemd integration succeeds and is visible through
+`task-submit --version`. Installation verifies that the update service and
+timer links both exist and that the timer is enabled and active; otherwise the
+old revision remains recorded so a later run can retry.
 
 When upgrading from a release whose updater never restarted the daemon, the
 first timer run installs this release and leaves the activation marker; the

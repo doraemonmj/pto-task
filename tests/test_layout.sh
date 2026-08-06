@@ -32,6 +32,8 @@ grep -Fqx "BIN_DIR=$BIN_DIR" "$INSTALL_ROOT/app/.pto-task-install-options"
 [[ -x "$INSTALL_ROOT/app/pto-task-auto-update" ]]
 [[ -f "$INSTALL_ROOT/app/.pto-task-restart-required" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task-auto-update.service" && -f "$INSTALL_ROOT/app/pto-task-auto-update.timer" ]]
+[[ "$(<"$INSTALL_ROOT/app/.pto-task-release")" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]
+[[ "$("$BIN_DIR/task-submit" --version)" == "pto-task revision $(git -C "$REPO_DIR" rev-parse HEAD)" ]]
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/pto-task-auto-update" "$INSTALL_ROOT/app/pto-task-auto-update.service"
 grep -Fqx 'OnCalendar=*-*-* 03:17:00 Asia/Shanghai' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
 grep -Fqx 'AccuracySec=1min' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
@@ -55,6 +57,45 @@ grep -q '^AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200' "$INSTALL_ROOT/config/taskqueu
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 666 ]]
 if [[ "$(id -u)" -eq 0 ]]; then
     [[ "$(stat -c %u "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 0 ]]
+    for root_dir in "$INSTALL_ROOT" "$INSTALL_ROOT/app" "$INSTALL_ROOT/config" \
+        "$INSTALL_ROOT/state" "$INSTALL_ROOT/logs" "$INSTALL_ROOT/tmp" \
+        "$INSTALL_ROOT/state/pending" "$INSTALL_ROOT/state/locks"; do
+        [[ "$(stat -c '%U:%G' "$root_dir")" == root:root ]]
+    done
+    [[ -z "$(find "$INSTALL_ROOT/app" -maxdepth 1 -type f ! -user root -print -quit)" ]]
+    [[ "$(stat -c '%U:%G' "$INSTALL_ROOT/config/taskqueue.conf")" == root:root ]]
+
+    leaf_target="$TEST_ROOT/managed-leaf-target"
+    leaf_directory_target="$TEST_ROOT/managed-leaf-directory-target"
+    printf 'unchanged\n' > "$leaf_target"
+    mkdir -p "$leaf_directory_target"
+    for managed_leaf in pto-task.service .pto-task-update-repository \
+        .pto-task-install-options .pto-task-restart-required; do
+        rm -f "$INSTALL_ROOT/app/$managed_leaf"
+        ln -s "$leaf_target" "$INSTALL_ROOT/app/$managed_leaf"
+    done
+    rm -f "$INSTALL_ROOT/app/.pto-task-release"
+    ln -s "$leaf_directory_target" "$INSTALL_ROOT/app/.pto-task-release"
+    bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" \
+        --sbin-dir "$SBIN_DIR" >/dev/null
+    [[ "$(<"$leaf_target")" == unchanged ]]
+    [[ -z "$(find "$leaf_directory_target" -mindepth 1 -print -quit)" ]]
+    for managed_leaf in pto-task.service .pto-task-update-repository \
+        .pto-task-install-options .pto-task-restart-required .pto-task-release; do
+        [[ -f "$INSTALL_ROOT/app/$managed_leaf" && ! -L "$INSTALL_ROOT/app/$managed_leaf" ]]
+        [[ "$(stat -c '%U:%G' "$INSTALL_ROOT/app/$managed_leaf")" == root:root ]]
+    done
+
+    managed_symlink_tools="$TEST_ROOT/managed-symlink-tools"
+    managed_symlink_target="$TEST_ROOT/managed-symlink-target"
+    mkdir -p "$managed_symlink_tools" "$managed_symlink_target"
+    ln -s "$managed_symlink_target" "$managed_symlink_tools/pto-task"
+    if bash "$REPO_DIR/setup.sh" --no-init-config --tools-root "$managed_symlink_tools" \
+        --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR" >/dev/null 2>&1; then
+        echo 'error: root setup accepted a symlinked managed installation directory' >&2
+        exit 1
+    fi
+    [[ -z "$(find "$managed_symlink_target" -mindepth 1 -print -quit)" ]]
 fi
 grep -Fqx 'https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/app/.pto-task-update-repository"
 grep -Fq 'AUTO_UPDATE_REPOSITORY=https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/config/taskqueue.conf"
@@ -100,6 +141,31 @@ if TASKQUEUE_LOCK_STATE_DIR="$INSTALL_ROOT/state" timeout 0.2 \
 fi
 [[ "$(<"$strict_lock")" == "$holder_before" ]]
 wait "$strict_lock_pid"
+
+# A root-owned mode-0666 lock is already correct. Ordinary users must not try
+# to chmod it. If a historical writable lock has another mode and chmod is not
+# permitted, locking still works and emits an administrator-facing warning.
+FAKE_CHMOD_BIN="$TEST_ROOT/fake-chmod-bin"
+mkdir -p "$FAKE_CHMOD_BIN"
+cat > "$FAKE_CHMOD_BIN/chmod" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$LAYOUT_TEST_ROOT/chmod-calls"
+exit 1
+EOF
+chmod 755 "$FAKE_CHMOD_BIN/chmod"
+rm -f "$TEST_ROOT/chmod-calls"
+TASKQUEUE_LOCK_STATE_DIR="$INSTALL_ROOT/state" LAYOUT_TEST_ROOT="$TEST_ROOT" \
+    PATH="$FAKE_CHMOD_BIN:$PATH" bash "$INSTALL_ROOT/app/npu_lock.sh" \
+    31 --timeout 1 -- true >/dev/null 2>"$TEST_ROOT/correct-lock.log"
+[[ ! -e "$TEST_ROOT/chmod-calls" ]]
+/usr/bin/chmod 660 "$strict_lock"
+TASKQUEUE_LOCK_STATE_DIR="$INSTALL_ROOT/state" LAYOUT_TEST_ROOT="$TEST_ROOT" \
+    PATH="$FAKE_CHMOD_BIN:$PATH" bash "$INSTALL_ROOT/app/npu_lock.sh" \
+    31 --timeout 1 -- true >/dev/null 2>"$TEST_ROOT/historical-lock.log"
+[[ -s "$TEST_ROOT/chmod-calls" ]]
+grep -Fq '警告: 共享锁权限为 660' "$TEST_ROOT/historical-lock.log"
+/usr/bin/chmod 666 "$strict_lock"
+
 "$INSTALL_ROOT/app/pto-task-usage-sampler"
 printf 'SUBMIT_USER=tester\nSUBMIT_TIME=%s\nSTART_TIME=%s\nFINISH_TIME=%s\nDEVICE=0\n' "$(date -Iseconds -d '2 minutes ago')" "$(date -Iseconds -d '1 minute ago')" "$(date -Iseconds)" > "$INSTALL_ROOT/state/done/task_stats_test"
 printf 'SUBMIT_USER=%s\nSUBMIT_TIME=%s\nSTART_TIME=%s\nFINISH_TIME=%s\nDEVICE=0\n' "$(id -un)" "$(date -Iseconds -d '2 minutes ago')" "$(date -Iseconds -d '1 minute ago')" "$(date -Iseconds)" > "$INSTALL_ROOT/state/done/task_stats_self"

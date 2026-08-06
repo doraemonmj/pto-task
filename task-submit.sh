@@ -109,6 +109,7 @@ task-submit — 提交任务到 root 执行队列
   task-submit -i --run "command"               交互式执行（可向任务输入 stdin）
 
 查询:
+  task-submit --version                        显示已安装源码 revision
   task-submit --wait <task-id>                 等待任务完成并实时输出日志
   task-submit --timeout N --wait <task-id>     自定义等待超时(秒，默认 600)
   task-submit --status <task-id>               查看任务状态
@@ -216,7 +217,7 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
             PTOAS_VERSION="$2"; shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
-        --wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--help|-h)
+        --version|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--help|-h)
             break ;;
         # 未知选项必须硬失败。此处曾是 `*) break`，会把未识别的 flag 连同其后的
         # --run/--timeout 一起当作任务命令提交，且 RUN_MODE 未置位时静默 exit 0
@@ -1394,6 +1395,13 @@ list_tasks() {
 
 # 主逻辑
 case "${1:-}" in
+    --version)
+        revision="$(cat "$SCRIPT_DIR/.pto-task-release" 2>/dev/null || true)"
+        if [[ -z "$revision" ]] && command -v git >/dev/null 2>&1; then
+            revision="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)"
+        fi
+        printf 'pto-task revision %s\n' "${revision:-unknown}"
+        ;;
     --wait)
         [[ -z "${2:-}" ]] && usage
         wait_task "$2"
