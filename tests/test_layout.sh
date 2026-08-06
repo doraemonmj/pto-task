@@ -65,6 +65,27 @@ if [[ "$(id -u)" -eq 0 ]]; then
     [[ -z "$(find "$INSTALL_ROOT/app" -maxdepth 1 -type f ! -user root -print -quit)" ]]
     [[ "$(stat -c '%U:%G' "$INSTALL_ROOT/config/taskqueue.conf")" == root:root ]]
 
+    leaf_target="$TEST_ROOT/managed-leaf-target"
+    leaf_directory_target="$TEST_ROOT/managed-leaf-directory-target"
+    printf 'unchanged\n' > "$leaf_target"
+    mkdir -p "$leaf_directory_target"
+    for managed_leaf in pto-task.service .pto-task-update-repository \
+        .pto-task-install-options .pto-task-restart-required; do
+        rm -f "$INSTALL_ROOT/app/$managed_leaf"
+        ln -s "$leaf_target" "$INSTALL_ROOT/app/$managed_leaf"
+    done
+    rm -f "$INSTALL_ROOT/app/.pto-task-release"
+    ln -s "$leaf_directory_target" "$INSTALL_ROOT/app/.pto-task-release"
+    bash "$REPO_DIR/setup.sh" --tools-root "$TOOLS_ROOT" --bin-dir "$BIN_DIR" \
+        --sbin-dir "$SBIN_DIR" >/dev/null
+    [[ "$(<"$leaf_target")" == unchanged ]]
+    [[ -z "$(find "$leaf_directory_target" -mindepth 1 -print -quit)" ]]
+    for managed_leaf in pto-task.service .pto-task-update-repository \
+        .pto-task-install-options .pto-task-restart-required .pto-task-release; do
+        [[ -f "$INSTALL_ROOT/app/$managed_leaf" && ! -L "$INSTALL_ROOT/app/$managed_leaf" ]]
+        [[ "$(stat -c '%U:%G' "$INSTALL_ROOT/app/$managed_leaf")" == root:root ]]
+    done
+
     managed_symlink_tools="$TEST_ROOT/managed-symlink-tools"
     managed_symlink_target="$TEST_ROOT/managed-symlink-target"
     mkdir -p "$managed_symlink_tools" "$managed_symlink_target"

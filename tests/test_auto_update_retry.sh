@@ -220,4 +220,32 @@ grep -Fq 'restart pto-task.service' "$TEST_ROOT/systemctl-calls"
 [[ ! -e "$APP_DIR/.pto-task-restart-required" ]]
 [[ ! -e "$APP_DIR/.pto-task-activation-retry" ]]
 
+# Never append root updater logs or write markers through historical leaf
+# symlinks. The external targets must remain untouched.
+printf '%s\n' 'log-target-unchanged' > "$TEST_ROOT/log-target"
+rm -f "$LOGS_DIR/auto-update.log" "$TEST_ROOT/attempts"
+ln -s "$TEST_ROOT/log-target" "$LOGS_DIR/auto-update.log"
+if RETRY_TEST_ROOT="$TEST_ROOT" PATH="$FAKE_BIN:$PATH" \
+    /usr/bin/bash "$APP_DIR/pto-task-auto-update" \
+    >/dev/null 2>"$TEST_ROOT/unsafe-log.stderr"; then
+    echo 'error: updater accepted a symlinked log file' >&2
+    exit 1
+fi
+[[ "$(<"$TEST_ROOT/log-target")" == log-target-unchanged ]]
+[[ ! -e "$TEST_ROOT/attempts" ]]
+grep -Fq 'automatic-update log must be a root-owned' "$TEST_ROOT/unsafe-log.stderr"
+
+rm -f "$LOGS_DIR/auto-update.log"
+install -m 644 /dev/null "$LOGS_DIR/auto-update.log"
+printf '%s\n' 'marker-target-unchanged' > "$TEST_ROOT/marker-target"
+ln -s "$TEST_ROOT/marker-target" "$APP_DIR/.pto-task-restart-required"
+if RETRY_TEST_ROOT="$TEST_ROOT" PATH="$FAKE_BIN:$PATH" \
+    /usr/bin/bash "$APP_DIR/pto-task-auto-update"; then
+    echo 'error: updater accepted a symlinked restart marker' >&2
+    exit 1
+fi
+[[ "$(<"$TEST_ROOT/marker-target")" == marker-target-unchanged ]]
+[[ ! -e "$TEST_ROOT/attempts" ]]
+grep -Fq 'update aborted: unsafe root control file:' "$LOGS_DIR/auto-update.log"
+
 echo 'auto-update retry tests passed'

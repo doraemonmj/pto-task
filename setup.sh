@@ -194,6 +194,43 @@ ensure_dir() {
     [[ -d "$dir" ]] || install -d -m "$mode" "$dir"
 }
 
+# Install managed app files by renaming a fresh inode from the same directory.
+# mv -T replaces a leaf symlink itself (including a symlink to a directory)
+# instead of following it, while the same-directory rename is atomic.
+finish_app_file() {
+    local temp="$1" destination="$2" mode="$3"
+    if [[ -d "$destination" && ! -L "$destination" ]]; then
+        rm -f "$temp"
+        echo "error: managed application file is a directory: $destination" >&2
+        return 1
+    fi
+    chmod "$mode" "$temp"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown root:root "$temp"
+    fi
+    mv -Tf -- "$temp" "$destination"
+}
+
+install_app_file() {
+    local source="$1" destination="$2" mode="$3" temp
+    temp="$(mktemp "$APP_DIR/.pto-task-install.XXXXXX")"
+    if ! install -m "$mode" "$source" "$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    finish_app_file "$temp" "$destination" "$mode"
+}
+
+write_app_file() {
+    local destination="$1" mode="$2" content="$3" temp
+    temp="$(mktemp "$APP_DIR/.pto-task-write.XXXXXX")"
+    if ! printf '%s' "$content" > "$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    finish_app_file "$temp" "$destination" "$mode"
+}
+
 # Open lock files without following the final path component, validate the
 # opened inode, and change metadata through that descriptor. Existing files
 # must be opened without O_CREAT: Linux protected_regular can reject an
@@ -389,43 +426,31 @@ if [[ "$(id -u)" -eq 0 ]]; then
     chown root:root "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
     chmod go-w "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
 fi
-install -m 755 "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit"
-install -m 755 "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon"
-install -m 755 "$SCRIPT_DIR/npu_lock.sh" "$APP_DIR/npu_lock.sh"
-install -m 755 "$SCRIPT_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update"
-install -m 755 "$SCRIPT_DIR/pto-task-usage-sampler.sh" "$APP_DIR/pto-task-usage-sampler"
-install -m 755 "$SCRIPT_DIR/pto-task-stats.sh" "$APP_DIR/pto-task-stats"
-sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task.service" > "$APP_DIR/pto-task.service"
-chmod 644 "$APP_DIR/pto-task.service"
-sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task-auto-update.service" > "$APP_DIR/pto-task-auto-update.service"
-chmod 644 "$APP_DIR/pto-task-auto-update.service"
-install -m 644 "$SCRIPT_DIR/pto-task-auto-update.timer" "$APP_DIR/pto-task-auto-update.timer"
-sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task-usage-sampler.service" > "$APP_DIR/pto-task-usage-sampler.service"
-chmod 644 "$APP_DIR/pto-task-usage-sampler.service"
-install -m 644 "$SCRIPT_DIR/pto-task-usage-sampler.timer" "$APP_DIR/pto-task-usage-sampler.timer"
-sed "s|/usr/local/bin/task-submit|$BIN_DIR/task-submit|g" "$SCRIPT_DIR/pto-task-clean.cron" > "$APP_DIR/pto-task-clean.cron"
-chmod 644 "$APP_DIR/pto-task-clean.cron"
+install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
+install_app_file "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon" 755
+install_app_file "$SCRIPT_DIR/npu_lock.sh" "$APP_DIR/npu_lock.sh" 755
+install_app_file "$SCRIPT_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update" 755
+install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.sh" "$APP_DIR/pto-task-usage-sampler" 755
+install_app_file "$SCRIPT_DIR/pto-task-stats.sh" "$APP_DIR/pto-task-stats" 755
+rendered_service="$(sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task.service")"
+write_app_file "$APP_DIR/pto-task.service" 644 "$rendered_service"$'\n'
+rendered_update_service="$(sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task-auto-update.service")"
+write_app_file "$APP_DIR/pto-task-auto-update.service" 644 "$rendered_update_service"$'\n'
+install_app_file "$SCRIPT_DIR/pto-task-auto-update.timer" "$APP_DIR/pto-task-auto-update.timer" 644
+rendered_usage_service="$(sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task-usage-sampler.service")"
+write_app_file "$APP_DIR/pto-task-usage-sampler.service" 644 "$rendered_usage_service"$'\n'
+install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.timer" "$APP_DIR/pto-task-usage-sampler.timer" 644
+rendered_clean_cron="$(sed "s|/usr/local/bin/task-submit|$BIN_DIR/task-submit|g" "$SCRIPT_DIR/pto-task-clean.cron")"
+write_app_file "$APP_DIR/pto-task-clean.cron" 644 "$rendered_clean_cron"$'\n'
 # The administrator already chose to execute this checkout as root, so trust
 # exactly this path for the read-only revision lookup without changing global
 # Git safe.directory configuration.
 SOURCE_REVISION="$(git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)"
 SOURCE_REVISION="${SOURCE_REVISION:-unknown}"
-printf '%s\n' "$SOURCE_UPDATE_REPOSITORY" > "$APP_DIR/.pto-task-update-repository"
-chmod 600 "$APP_DIR/.pto-task-update-repository"
-printf 'BIN_DIR=%q\nSBIN_DIR=%q\n' "$BIN_DIR" "$SBIN_DIR" > "$APP_DIR/.pto-task-install-options"
-chmod 600 "$APP_DIR/.pto-task-install-options"
-if [[ "$(id -u)" -eq 0 ]]; then
-    # Redirection preserves the owner of an existing destination. Normalize
-    # every generated control/unit file because the root updater later trusts
-    # some of them and systemd executes others.
-    chown root:root \
-        "$APP_DIR/pto-task.service" \
-        "$APP_DIR/pto-task-auto-update.service" \
-        "$APP_DIR/pto-task-usage-sampler.service" \
-        "$APP_DIR/pto-task-clean.cron" \
-        "$APP_DIR/.pto-task-update-repository" \
-        "$APP_DIR/.pto-task-install-options"
-fi
+write_app_file "$APP_DIR/.pto-task-update-repository" 600 \
+    "$SOURCE_UPDATE_REPOSITORY"$'\n'
+printf -v install_options 'BIN_DIR=%q\nSBIN_DIR=%q\n' "$BIN_DIR" "$SBIN_DIR"
+write_app_file "$APP_DIR/.pto-task-install-options" 600 "$install_options"
 
 if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
     initial_state_dir="$STATE_DIR"
@@ -592,22 +617,12 @@ fi
 # setup.sh deliberately does not restart the daemon. Leave a persistent marker
 # so deploy.sh or the idle-only updater can activate these files safely. This
 # also bridges upgrades initiated by an older updater that did not restart.
-: > "$APP_DIR/.pto-task-restart-required"
-chmod 600 "$APP_DIR/.pto-task-restart-required"
-if [[ "$(id -u)" -eq 0 ]]; then
-    chown root:root "$APP_DIR/.pto-task-restart-required"
-fi
+write_app_file "$APP_DIR/.pto-task-restart-required" 600 ""
 
 # Commit the installed revision only after every requested integration step and
 # the restart marker have succeeded. If a late step fails, the previous revision
 # remains visible and the next updater run will retry the installation.
-release_tmp="$(mktemp "$APP_DIR/.pto-task-release.XXXXXX")"
-printf '%s\n' "$SOURCE_REVISION" > "$release_tmp"
-chmod 644 "$release_tmp"
-if [[ "$(id -u)" -eq 0 ]]; then
-    chown root:root "$release_tmp"
-fi
-mv -f "$release_tmp" "$APP_DIR/.pto-task-release"
+write_app_file "$APP_DIR/.pto-task-release" 644 "$SOURCE_REVISION"$'\n'
 
 if [[ "$services_started" == true ]]; then
     printf 'The task daemon was not started or restarted.\n'

@@ -33,6 +33,23 @@ root_shared_directory_is_safe() {
     [[ "$(stat -c %a "$path" 2>/dev/null || true)" == 1777 ]]
 }
 
+path_exists_or_is_link() {
+    [[ -e "$1" || -L "$1" ]]
+}
+
+replace_root_empty_file() {
+    local destination="$1" mode="$2" parent temp
+    parent="$(dirname "$destination")"
+    if [[ -d "$destination" && ! -L "$destination" ]]; then
+        echo "error: managed control file is a directory: $destination" >&2
+        return 1
+    fi
+    temp="$(mktemp "$parent/.pto-task-write.XXXXXX")"
+    chmod "$mode" "$temp"
+    chown root:root "$temp"
+    mv -Tf -- "$temp" "$destination"
+}
+
 [ -f "$CONFIG_FILE" ] || exit 0
 CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 if [[ "$(id -u)" -ne 0 ]] ||
@@ -74,6 +91,14 @@ if ! root_control_path_is_safe "$STATE_DIR" directory ||
     exit 1
 fi
 LOG_FILE="$LOGS_DIR/auto-update.log"
+if path_exists_or_is_link "$LOG_FILE"; then
+    if ! root_control_path_is_safe "$LOG_FILE" file; then
+        echo "error: automatic-update log must be a root-owned, single-link regular file and not group/world-writable" >&2
+        exit 1
+    fi
+else
+    replace_root_empty_file "$LOG_FILE" 644
+fi
 log() { printf '%s %s\n' "$(date -Iseconds)" "$*" >> "$LOG_FILE"; }
 short_revision() {
     local revision="${1:-unknown}"
@@ -86,11 +111,18 @@ append_setup_log() {
     done < "$1"
 }
 
-if [[ -f "$APP_DIR/.pto-task-install-options" ]] &&
+if path_exists_or_is_link "$APP_DIR/.pto-task-install-options" &&
    ! root_control_path_is_safe "$APP_DIR/.pto-task-install-options" file; then
     log 'update aborted: unsafe installer-options control file'
     exit 1
 fi
+for control_file in "$APP_DIR/.pto-task-release" "$RESTART_MARKER" "$ACTIVATION_RETRY_MARKER"; do
+    if path_exists_or_is_link "$control_file" &&
+       ! root_control_path_is_safe "$control_file" file; then
+        log "update aborted: unsafe root control file: $control_file"
+        exit 1
+    fi
+done
 
 if [[ -z "$UPDATE_REPOSITORY" ]]; then
     log 'automatic update disabled: AUTO_UPDATE_REPOSITORY is empty'
@@ -197,11 +229,18 @@ if [[ "$update_required" == true ]]; then
     if (( setup_rc == 0 )); then
         # New setup.sh creates this marker itself. Creating it here as well
         # keeps activation reliable for repositories with an older installer.
-        : > "$RESTART_MARKER"
-        chmod 600 "$RESTART_MARKER"
-        chown root:root "$RESTART_MARKER"
+        if path_exists_or_is_link "$RESTART_MARKER" &&
+           ! root_control_path_is_safe "$RESTART_MARKER" file; then
+            log "update aborted: installer produced an unsafe restart marker"
+            exit 1
+        fi
+        replace_root_empty_file "$RESTART_MARKER" 600
     else
         log "update failed while installing app (rc=$setup_rc target=$(short_revision "$remote_revision")); previous revision remains retryable"
+        exit 1
+    fi
+    if ! root_control_path_is_safe "$APP_DIR/.pto-task-release" file; then
+        log 'update verification failed: installer did not produce a safe release file'
         exit 1
     fi
     installed_after="$(cat "$APP_DIR/.pto-task-release" 2>/dev/null || true)"
@@ -224,9 +263,12 @@ if [[ -e "$RESTART_MARKER" ]]; then
     fi
 
     if [[ "$daemon_should_activate" == true ]]; then
-        : > "$ACTIVATION_RETRY_MARKER"
-        chmod 600 "$ACTIVATION_RETRY_MARKER"
-        chown root:root "$ACTIVATION_RETRY_MARKER"
+        if path_exists_or_is_link "$ACTIVATION_RETRY_MARKER" &&
+           ! root_control_path_is_safe "$ACTIVATION_RETRY_MARKER" file; then
+            log 'update aborted: unsafe activation-retry marker'
+            exit 1
+        fi
+        replace_root_empty_file "$ACTIVATION_RETRY_MARKER" 600
         # During the first migration taskqueue.service can still be the old
         # canonical unit. On later installs it is just the compatibility alias.
         if systemctl is-active --quiet taskqueue.service; then
