@@ -14,6 +14,7 @@ TMP_DIR="$INSTALL_ROOT/tmp"
 FAKE_BIN="$TEST_ROOT/bin"
 mkdir -p "$APP_DIR" "$CONFIG_DIR" "$STATE_DIR/locks" "$STATE_DIR/pending" \
     "$STATE_DIR/running" "$LOGS_DIR" "$TMP_DIR" "$FAKE_BIN"
+chmod 1777 "$STATE_DIR/locks" "$STATE_DIR/pending"
 install -m 755 "$REPO_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update"
 install -m 666 /dev/null "$STATE_DIR/locks/update-reservation.lock"
 
@@ -37,6 +38,11 @@ if [[ "${1:-}" == -u ]]; then
     exit 0
 fi
 exec /usr/bin/id "$@"
+EOF
+
+cat > "$FAKE_BIN/chown" <<'EOF'
+#!/usr/bin/bash
+exit 0
 EOF
 
 cat > "$FAKE_BIN/stat" <<'EOF'
@@ -79,6 +85,10 @@ cat > "$FAKE_BIN/bash" <<'EOF'
 #!/usr/bin/bash
 if [[ "${1:-}" == */setup.sh ]]; then
     printf '%s\n' "$*" > "$RETRY_TEST_ROOT/install-call"
+    if [[ "${RETRY_SETUP_FAIL:-false}" == true ]]; then
+        printf '%s\n' 'simulated setup permission failure'
+        exit 42
+    fi
     printf '%s\n' 'remote-revision' > "$RETRY_APP_DIR/.pto-task-release"
     touch "$RETRY_APP_DIR/.pto-task-restart-required"
     exit 0
@@ -143,8 +153,41 @@ grep -Fq 'update check failed after 3 attempts: unable to fetch repository' \
     "$LOGS_DIR/auto-update.log"
 [[ "$config_before" == "$(sha256sum "$CONFIG_DIR/taskqueue.conf")" ]]
 
+# Installer stderr/stdout and its real exit status must survive in the updater
+# log. A failed install must not be mistaken for an activated new revision.
+printf '%s\n' 'installed-revision' > "$APP_DIR/.pto-task-release"
+rm -f "$APP_DIR/.pto-task-restart-required" "$APP_DIR/.pto-task-activation-retry" \
+    "$TEST_ROOT/attempts" "$TEST_ROOT/sleeps" "$TEST_ROOT/install-call"
+if RETRY_SETUP_FAIL=true RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" \
+    PATH="$FAKE_BIN:$PATH" /usr/bin/bash "$APP_DIR/pto-task-auto-update"; then
+    echo 'error: updater succeeded after setup failed' >&2
+    exit 1
+fi
+[[ "$(<"$APP_DIR/.pto-task-release")" == installed-revision ]]
+grep -Fq 'setup: simulated setup permission failure' "$LOGS_DIR/auto-update.log"
+grep -Fq 'update failed while installing app (rc=42 target=remote-revis)' \
+    "$LOGS_DIR/auto-update.log"
+
+# The root updater must never source installer options that another user can
+# modify. This is a root-code-execution boundary, not merely a mode preference.
+printf '%s\n' 'touch "$RETRY_TEST_ROOT/unsafe-options-executed"' \
+    > "$APP_DIR/.pto-task-install-options"
+chmod 666 "$APP_DIR/.pto-task-install-options"
+rm -f "$TEST_ROOT/attempts" "$TEST_ROOT/unsafe-options-executed"
+if RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" PATH="$FAKE_BIN:$PATH" \
+    /usr/bin/bash "$APP_DIR/pto-task-auto-update"; then
+    echo 'error: updater accepted writable installer options' >&2
+    exit 1
+fi
+[[ ! -e "$TEST_ROOT/unsafe-options-executed" ]]
+[[ ! -e "$TEST_ROOT/attempts" ]]
+grep -Fq 'update aborted: unsafe installer-options control file' \
+    "$LOGS_DIR/auto-update.log"
+rm -f "$APP_DIR/.pto-task-install-options"
+
 # A setup performed by an older updater leaves a restart marker. Even when the
 # installed revision already matches remote, the new updater must activate it.
+printf '%s\n' 'remote-revision' > "$APP_DIR/.pto-task-release"
 touch "$APP_DIR/.pto-task-restart-required"
 rm -f "$TEST_ROOT/install-call" "$TEST_ROOT/systemctl-calls"
 RETRY_TEST_ROOT="$TEST_ROOT" RETRY_APP_DIR="$APP_DIR" PATH="$FAKE_BIN:$PATH" \

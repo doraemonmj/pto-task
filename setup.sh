@@ -195,10 +195,11 @@ ensure_dir() {
 }
 
 # Open lock files without following the final path component, validate the
-# opened inode, and change metadata through that descriptor. This keeps a
-# lower-trust owner of a historical lock entry from redirecting root chmod or
-# chown while setup is repairing a mode-1777 lock directory. Existing inodes
-# are never replaced or truncated, so active flock users remain synchronized.
+# opened inode, and change metadata through that descriptor. Existing files
+# must be opened without O_CREAT: Linux protected_regular can reject an
+# O_CREAT open of another user's file in a sticky directory even for the root
+# updater. Missing files are created separately with O_CREAT|O_EXCL. Existing
+# inodes are never replaced or truncated, so active flock users stay synced.
 repair_lock_metadata() {
     local root_owner=false
     (( $# > 0 )) || return 0
@@ -222,8 +223,8 @@ root_owner = sys.argv[1] == "true"
 if not hasattr(os, "O_NOFOLLOW"):
     fail("<platform>", "O_NOFOLLOW is unavailable")
 
-flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW
-flags |= getattr(os, "O_CLOEXEC", 0)
+base_flags = os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW
+base_flags |= getattr(os, "O_CLOEXEC", 0)
 old_umask = os.umask(0)
 try:
     for path in sys.argv[2:]:
@@ -237,10 +238,29 @@ try:
         except OSError as exc:
             fail(path, f"cannot open lock directory: {exc.strerror}")
         try:
-            try:
-                fd = os.open(name, flags, 0o666, dir_fd=dir_fd)
-            except OSError as exc:
-                fail(path, f"cannot open without following links: {exc.strerror}")
+            for attempt in range(2):
+                try:
+                    fd = os.open(name, base_flags, dir_fd=dir_fd)
+                    break
+                except FileNotFoundError:
+                    try:
+                        fd = os.open(
+                            name,
+                            base_flags | os.O_CREAT | os.O_EXCL,
+                            0o666,
+                            dir_fd=dir_fd,
+                        )
+                        break
+                    except FileExistsError:
+                        if attempt == 0:
+                            continue
+                        fail(path, "path kept changing while creating lock")
+                    except OSError as exc:
+                        fail(path, f"cannot create lock safely: {exc.strerror}")
+                except OSError as exc:
+                    fail(path, f"cannot open without following links: {exc.strerror}")
+            else:
+                fail(path, "cannot open lock after creation race")
             try:
                 opened = os.fstat(fd)
                 if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
@@ -276,6 +296,14 @@ prepare_state_layout() {
         echo "error: STATE_DIR must be an absolute directory other than /" >&2
         exit 1
     }
+    for managed_state_dir in "$state_dir" "$state_dir/pending" "$state_dir/locks" \
+        "$state_dir/kill" "$state_dir/fifo" "$state_dir/running" \
+        "$state_dir/done" "$state_dir/usage"; do
+        [[ ! -L "$managed_state_dir" ]] || {
+            echo "error: managed state directory must not be a symlink: $managed_state_dir" >&2
+            exit 1
+        }
+    done
     ensure_dir 755 "$state_dir"
     ensure_dir 1777 "$state_dir/pending"
     ensure_dir 1777 "$state_dir/locks"
@@ -285,6 +313,11 @@ prepare_state_layout() {
     ensure_dir 755 "$state_dir/done"
     ensure_dir 755 "$state_dir/usage"
     chmod 1777 "$state_dir/pending" "$state_dir/locks" "$state_dir/kill" "$state_dir/fifo"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown root:root "$state_dir" "$state_dir/pending" "$state_dir/locks" \
+            "$state_dir/kill" "$state_dir/fifo" "$state_dir/running" \
+            "$state_dir/done" "$state_dir/usage"
+    fi
 
     lock_file="$state_dir/locks/update-reservation.lock"
     repair_lock_metadata "$lock_file"
@@ -304,21 +337,24 @@ precreate_device_locks() {
     local -a device_ids=()
     if [[ -n "$configured_devices" ]]; then
         IFS=',' read -r -a device_ids <<< "$configured_devices"
-    else
-        count="$(detect_device_count)"
-        for ((id = 0; id < count; id++)); do
-            device_ids+=("$id")
-        done
     fi
+    # AVAILABLE_DEVICES limits automatic allocation, but users may explicitly
+    # request another physical card. Pre-create the union so those legitimate
+    # locks also remain root:root instead of being first-created by a user.
+    count="$(detect_device_count)"
+    for ((id = 0; id < count; id++)); do
+        device_ids+=("$id")
+    done
 
-    for id in "${device_ids[@]}"; do
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
         [[ "$id" =~ ^[0-9]+$ ]] || {
             echo "error: invalid device id in AVAILABLE_DEVICES: $id" >&2
             exit 2
         }
         lock_file="$state_dir/locks/npu_device_${id}.lock"
         repair_lock_metadata "$lock_file"
-    done
+    done < <(printf '%s\n' "${device_ids[@]}" | sort -n -u)
 }
 
 if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
@@ -326,6 +362,19 @@ if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
           ("$INTERACTIVE_CONFIG" == auto && -t 0) ]]; then
         prompt_initial_config
     fi
+fi
+
+# Reject managed-directory symlinks before creating or repairing anything
+# below them. setup.sh normally runs as root, so following a legacy
+# user-created symlink here could otherwise change metadata outside the
+# installation tree.
+if [[ "$(id -u)" -eq 0 ]]; then
+    for managed_dir in "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOGS_DIR" "$TMP_DIR"; do
+        [[ ! -L "$managed_dir" ]] || {
+            echo "error: managed installation directory must not be a symlink: $managed_dir" >&2
+            exit 1
+        }
+    done
 fi
 
 ensure_dir 755 "$APP_DIR"
@@ -337,12 +386,8 @@ prepare_state_layout "$STATE_DIR"
 # Root system units execute files from APP_DIR, so keep the installed code
 # directories root-owned and non-writable by other users.
 if [[ "$(id -u)" -eq 0 ]]; then
-    [[ ! -L "$TOOL_ROOT" && ! -L "$APP_DIR" ]] || {
-        echo "error: application directories must not be symlinks" >&2
-        exit 1
-    }
-    chown root:root "$TOOL_ROOT" "$APP_DIR"
-    chmod go-w "$TOOL_ROOT" "$APP_DIR"
+    chown root:root "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
+    chmod go-w "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
 fi
 install -m 755 "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit"
 install -m 755 "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon"
@@ -360,16 +405,27 @@ chmod 644 "$APP_DIR/pto-task-usage-sampler.service"
 install -m 644 "$SCRIPT_DIR/pto-task-usage-sampler.timer" "$APP_DIR/pto-task-usage-sampler.timer"
 sed "s|/usr/local/bin/task-submit|$BIN_DIR/task-submit|g" "$SCRIPT_DIR/pto-task-clean.cron" > "$APP_DIR/pto-task-clean.cron"
 chmod 644 "$APP_DIR/pto-task-clean.cron"
-git -C "$SCRIPT_DIR" rev-parse HEAD > "$APP_DIR/.pto-task-release" 2>/dev/null || :
-# setup.sh deliberately does not restart the daemon. Leave a persistent marker
-# so deploy.sh or the idle-only updater can activate these files safely. This
-# also bridges upgrades initiated by an older updater that did not restart.
-: > "$APP_DIR/.pto-task-restart-required"
-chmod 600 "$APP_DIR/.pto-task-restart-required"
+# The administrator already chose to execute this checkout as root, so trust
+# exactly this path for the read-only revision lookup without changing global
+# Git safe.directory configuration.
+SOURCE_REVISION="$(git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)"
+SOURCE_REVISION="${SOURCE_REVISION:-unknown}"
 printf '%s\n' "$SOURCE_UPDATE_REPOSITORY" > "$APP_DIR/.pto-task-update-repository"
 chmod 600 "$APP_DIR/.pto-task-update-repository"
 printf 'BIN_DIR=%q\nSBIN_DIR=%q\n' "$BIN_DIR" "$SBIN_DIR" > "$APP_DIR/.pto-task-install-options"
 chmod 600 "$APP_DIR/.pto-task-install-options"
+if [[ "$(id -u)" -eq 0 ]]; then
+    # Redirection preserves the owner of an existing destination. Normalize
+    # every generated control/unit file because the root updater later trusts
+    # some of them and systemd executes others.
+    chown root:root \
+        "$APP_DIR/pto-task.service" \
+        "$APP_DIR/pto-task-auto-update.service" \
+        "$APP_DIR/pto-task-usage-sampler.service" \
+        "$APP_DIR/pto-task-clean.cron" \
+        "$APP_DIR/.pto-task-update-repository" \
+        "$APP_DIR/.pto-task-install-options"
+fi
 
 if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
     initial_state_dir="$STATE_DIR"
@@ -450,7 +506,15 @@ if [[ -f "$CONFIG_FILE" ]]; then
         echo "error: LOGS_DIR must be an absolute directory other than /" >&2
         exit 1
     }
+    [[ ! -L "$configured_logs_dir" ]] || {
+        echo "error: managed log directory must not be a symlink: $configured_logs_dir" >&2
+        exit 1
+    }
     ensure_dir 755 "$configured_logs_dir"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown root:root "$configured_logs_dir"
+        chmod go-w "$configured_logs_dir"
+    fi
     precreate_device_locks "$configured_state_dir" "$configured_devices"
 fi
 
@@ -498,6 +562,18 @@ if [[ -f "$CONFIG_FILE" && "$(id -u)" -eq 0 ]]; then
     systemctl daemon-reload
     if [[ "$ENABLE_AUTO_UPDATE" == true ]]; then
         systemctl enable --now pto-task-auto-update.timer
+        installed_update_service="$(readlink -f /etc/systemd/system/pto-task-auto-update.service 2>/dev/null || true)"
+        installed_update_timer="$(readlink -f /etc/systemd/system/pto-task-auto-update.timer 2>/dev/null || true)"
+        if [[ "$installed_update_service" != "$APP_DIR/pto-task-auto-update.service" ||
+              "$installed_update_timer" != "$APP_DIR/pto-task-auto-update.timer" ]]; then
+            echo 'error: automatic-update systemd units were not linked to the installed application' >&2
+            exit 1
+        fi
+        if ! systemctl is-enabled --quiet pto-task-auto-update.timer ||
+           ! systemctl is-active --quiet pto-task-auto-update.timer; then
+            echo 'error: automatic-update timer was installed but is not enabled and active' >&2
+            exit 1
+        fi
         services_started=true
         printf 'Automatic update timer enabled.\n'
     fi
@@ -512,6 +588,27 @@ if [[ -f "$CONFIG_FILE" && "$(id -u)" -eq 0 ]]; then
 elif [[ "$ENABLE_AUTO_UPDATE" == true ]]; then
     printf 'Automatic update timer not enabled (requires root and initialized config).\n'
 fi
+
+# setup.sh deliberately does not restart the daemon. Leave a persistent marker
+# so deploy.sh or the idle-only updater can activate these files safely. This
+# also bridges upgrades initiated by an older updater that did not restart.
+: > "$APP_DIR/.pto-task-restart-required"
+chmod 600 "$APP_DIR/.pto-task-restart-required"
+if [[ "$(id -u)" -eq 0 ]]; then
+    chown root:root "$APP_DIR/.pto-task-restart-required"
+fi
+
+# Commit the installed revision only after every requested integration step and
+# the restart marker have succeeded. If a late step fails, the previous revision
+# remains visible and the next updater run will retry the installation.
+release_tmp="$(mktemp "$APP_DIR/.pto-task-release.XXXXXX")"
+printf '%s\n' "$SOURCE_REVISION" > "$release_tmp"
+chmod 644 "$release_tmp"
+if [[ "$(id -u)" -eq 0 ]]; then
+    chown root:root "$release_tmp"
+fi
+mv -f "$release_tmp" "$APP_DIR/.pto-task-release"
+
 if [[ "$services_started" == true ]]; then
     printf 'The task daemon was not started or restarted.\n'
 else

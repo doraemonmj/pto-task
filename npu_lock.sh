@@ -291,13 +291,14 @@ for dev in "${need_lock[@]}"; do
         done
         exit 1
     fi
-    if ! chmod 666 "/proc/self/fd/$fd" 2>/dev/null; then
-        echo "${C_RED}[npu-lock] 错误: 无法修复共享锁权限: $lock_file${C_RESET}" >&2
-        exec {fd}>&-
-        for prev_fd in "${lock_fds[@]}"; do
-            exec {prev_fd}>&-
-        done
-        exit 1
+    # Production locks are pre-created as root:root mode 0666 by setup.sh.
+    # Ordinary users can open them but cannot chmod them, which is expected.
+    # Only attempt a repair when the mode is actually wrong, and do not reject
+    # a caller that already opened the lock successfully.
+    lock_mode="$(stat -Lc %a "/proc/self/fd/$fd" 2>/dev/null || true)"
+    if [[ "$lock_mode" != 666 ]] && ! chmod 666 "/proc/self/fd/$fd" 2>/dev/null; then
+        echo "${C_YELLOW}[npu-lock] 警告: 共享锁权限为 ${lock_mode:-未知}，当前用户无法修复: $lock_file${C_RESET}" >&2
+        echo "${C_DIM}[npu-lock] 当前访问可继续；请管理员执行 sudo bash deploy.sh 统一为 root:root 0666${C_RESET}" >&2
     fi
 
     if [[ $timeout -eq 0 ]]; then
