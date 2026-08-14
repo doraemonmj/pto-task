@@ -58,6 +58,7 @@ DEVICE_NUM=""
 RUN_MODE=false
 CLEAN_DAYS=1
 MAX_TIME=300    # 任务最大执行时间（秒），0=不限
+MAX_CONCURRENT_8_CARD_TASKS=${MAX_CONCURRENT_8_CARD_TASKS:-0}
 INTERACTIVE=false # --interactive 交互式模式
 EXTRA_ENVS=()    # --env 收集的额外环境变量
 ENV_FILES=()     # --env-file 收集的环境变量文件
@@ -274,6 +275,50 @@ is_auto_device_request() {
     local request
     request="$(build_device_request)"
     [[ "$request" == "auto" || "$request" == auto:* ]]
+}
+
+# Count distinct physical devices represented by DEVICE/auto:N. This mirrors
+# the daemon's scheduler-side check and is used only for user-facing notices;
+# the daemon remains authoritative under concurrent submissions.
+device_request_count() {
+    local request="$1" id
+    local -a ids
+    local -A seen=()
+    case "$request" in
+        ""|none) printf '0' ;;
+        auto) printf '1' ;;
+        auto:*)
+            if [[ "$request" =~ ^auto:([1-9][0-9]*)$ ]]; then
+                printf '%s' "${BASH_REMATCH[1]}"
+            else
+                printf '0'
+            fi
+            ;;
+        *)
+            if [[ ! "$request" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+                printf '0'
+                return
+            fi
+            IFS=',' read -ra ids <<< "$request"
+            for id in "${ids[@]}"; do seen["$id"]=1; done
+            printf '%s' "${#seen[@]}"
+            ;;
+    esac
+}
+
+eight_card_policy_enabled() {
+    [[ "$MAX_CONCURRENT_8_CARD_TASKS" =~ ^[1-9][0-9]*$ ]]
+}
+
+show_eight_card_policy_notice() {
+    local request="$1"
+    eight_card_policy_enabled || return 0
+    [[ "$(device_request_count "$request")" -eq 8 ]] || return 0
+    if [[ "$MAX_CONCURRENT_8_CARD_TASKS" -eq 1 ]]; then
+        echo "${C_YELLOW}提示: 当前服务器同时只运行一个 8 卡用例；如已有 8 卡用例运行，本任务会继续排队，不阻塞后续小卡任务。${C_RESET}" >&2
+    else
+        echo "${C_YELLOW}提示: 当前服务器同时最多运行 ${MAX_CONCURRENT_8_CARD_TASKS} 个 8 卡用例；超出时任务会继续排队。${C_RESET}" >&2
+    fi
 }
 
 # 校验卡组（TASKQUEUE_DEVICE_POOL）：格式 + 与全局白名单是否有交集
@@ -1466,6 +1511,7 @@ case "${1:-}" in
         fi
         resolve_ptoas
         task_id=$(submit_task "$1")
+        show_eight_card_policy_notice "$(build_device_request)"
         if [[ "$RUN_MODE" == "true" ]]; then
             echo "${C_DIM}任务已提交: $task_id (断开后可用 task-submit --wait $task_id 重连)${C_RESET}" >&2
             wait_task "$task_id"

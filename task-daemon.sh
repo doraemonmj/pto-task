@@ -40,6 +40,14 @@ LOG_FILE="$LOGS_DIR/taskqueue.log"
 POLL_INTERVAL=0.2
 KILL_GRACE=${KILL_GRACE:-5}   # --kill 后等待 SIGTERM 优雅退出的宽限期(秒)，超时升级到 SIGKILL
 MAX_CONCURRENT=${MAX_CONCURRENT:-1}
+# Optional per-host admission limit for jobs that request exactly eight cards.
+# Zero keeps historical scheduling behavior, so code updates do not enable the
+# policy on hosts whose preserved local configuration does not opt in.
+MAX_CONCURRENT_8_CARD_TASKS=${MAX_CONCURRENT_8_CARD_TASKS:-0}
+if [[ ! "$MAX_CONCURRENT_8_CARD_TASKS" =~ ^[0-9]+$ ]]; then
+    echo "error: MAX_CONCURRENT_8_CARD_TASKS must be a non-negative integer" >&2
+    exit 1
+fi
 # 用户可请求更短超时，但不能绕过服务器硬上限。0 表示服务器不设硬上限。
 MAX_TIME_HARD_CAP=${MAX_TIME_HARD_CAP:-0}
 TASK_EXECUTION_MODE="${TASK_EXECUTION_MODE:-HwHiAiUser}"
@@ -125,10 +133,44 @@ EOF
 # 在主循环开头刷新；调度循环里每分配一张卡就追加一次，使本轮后续的 any_device_in_use
 # 立刻能看到新占用，避免同一轮把同一张卡分给两个任务。
 IN_USE_SET=","
+RUNNING_8_CARD_TASKS=0
+
+# Return the number of distinct devices represented by a task DEVICE field.
+# Pending auto:N requests have not been resolved yet; running tasks contain the
+# concrete comma-separated allocation. Invalid values return zero and are left
+# to the existing daemon-side task validation/execution path.
+device_request_count() {
+    local request="$1" id
+    local -a ids
+    local -A seen=()
+    case "$request" in
+        ""|none) printf '0' ;;
+        auto) printf '1' ;;
+        auto:*)
+            if [[ "$request" =~ ^auto:([1-9][0-9]*)$ ]]; then
+                printf '%s' "${BASH_REMATCH[1]}"
+            else
+                printf '0'
+            fi
+            ;;
+        *)
+            if [[ ! "$request" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+                printf '0'
+                return
+            fi
+            IFS=',' read -ra ids <<< "$request"
+            for id in "${ids[@]}"; do
+                seen["$id"]=1
+            done
+            printf '%s' "${#seen[@]}"
+            ;;
+    esac
+}
 
 update_in_use_set() {
     IN_USE_SET=","
-    local rf dev d
+    RUNNING_8_CARD_TASKS=0
+    local rf dev d device_count
     local -a _devs
     for rf in "$RUNNING_DIR"/task_*; do
         [ -f "$rf" ] || continue
@@ -137,6 +179,10 @@ update_in_use_set() {
         [[ -z "$dev" || "$dev" == "none" ]] && continue
         # 未被 sed -i 改写的 auto 标记跳过（窗口极短）
         [[ "$dev" == "auto" || "$dev" == auto:* ]] && continue
+        device_count=$(device_request_count "$dev")
+        if [[ "$device_count" -eq 8 ]]; then
+            RUNNING_8_CARD_TASKS=$((RUNNING_8_CARD_TASKS + 1))
+        fi
         # 支持多卡任务："5,7" 拆开各自落入集合
         IFS=',' read -ra _devs <<< "$dev"
         for d in "${_devs[@]}"; do
@@ -847,6 +893,17 @@ while $RUNNING; do
 
         # 设备感知调度
         pending_dev=$(read_field DEVICE "$task_file")
+        pending_device_count=$(device_request_count "$pending_dev")
+
+        # Host-local opt-in policy: an eight-card task that exceeds its
+        # dedicated concurrency cap stays pending. Continue (not break) so a
+        # blocked large task never prevents later smaller jobs from using the
+        # remaining devices.
+        if (( MAX_CONCURRENT_8_CARD_TASKS > 0 )) &&
+           [[ "$pending_device_count" -eq 8 ]] &&
+           (( RUNNING_8_CARD_TASKS >= MAX_CONCURRENT_8_CARD_TASKS )); then
+            continue
+        fi
 
         # auto / auto:N 分配：仅查找空闲设备，不修改文件（卡组从任务文件读取，收窄分配范围）
         if [[ "$pending_dev" == "auto" || "$pending_dev" == auto:* ]]; then
@@ -881,6 +938,9 @@ while $RUNNING; do
         run_task "$task_id" &
         JOB_PIDS+=($!)
         CURRENT_JOBS=$((CURRENT_JOBS + 1))
+        if [[ "$pending_device_count" -eq 8 ]]; then
+            RUNNING_8_CARD_TASKS=$((RUNNING_8_CARD_TASKS + 1))
+        fi
     done
 
     sleep "$POLL_INTERVAL"

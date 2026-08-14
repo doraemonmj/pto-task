@@ -60,6 +60,17 @@ sudo bash deploy.sh --max-concurrent 8 --available-devices 0,1,2,3 \
 如需关闭自动更新，部署时使用 `sudo bash deploy.sh --disable-auto-update`；后续
 手动升级也继续携带该选项，因为普通部署默认会重新安装并验证自动更新 timer。
 
+如果某台共享开发服务器需要限制 8 卡用例并发，可仅在该机的
+`/home/pypto-tools/pto-task/config/taskqueue.conf` 中设置：
+
+```bash
+MAX_CONCURRENT_8_CARD_TASKS=1
+```
+
+默认值为 `0`（关闭），其他服务器自动更新代码后不会自动开启。开启后，
+已有一个 8 卡用例运行时，后续 8 卡用例保持 pending；daemon 会跳过它
+继续调度后面的小卡任务。
+
 从旧版（自动更新从不重启 daemon）迁移时，第一次定时运行会安装新版并留下待激活
 标记，下一次定时运行完成激活；如果希望发布后立即生效，在已有服务器上手动执行
 一次 `sudo bash deploy.sh` 即可。
