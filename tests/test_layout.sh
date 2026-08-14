@@ -49,6 +49,7 @@ for private_dir in running 'done' usage; do
 done
 grep -q '^TASK_EXECUTION_MODE="HwHiAiUser"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^PTOAS_BASE="/usr/local/ptoas"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
+grep -q '^MAX_CONCURRENT_8_CARD_TASKS=0[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(grep -c '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf")" -eq 1 ]]
 grep -q '^AUTO_UPDATE_BRANCH="main"' "$INSTALL_ROOT/config/taskqueue.conf"
@@ -347,5 +348,6 @@ fi
 
 bash "$REPO_DIR/tests/test_auto_update_retry.sh"
 bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
+bash "$REPO_DIR/tests/test_eight_card_limit.sh"
 
 echo 'layout tests passed'

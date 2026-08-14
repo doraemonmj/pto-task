@@ -14,6 +14,12 @@ it to `root` only for a fully trusted queue; every submitted command will then
 run with root privileges. `STATE_DIR` and `LOGS_DIR` normally remain the paths
 written by the installer.
 
+`MAX_CONCURRENT_8_CARD_TASKS` defaults to `0`, which preserves the historical
+scheduler behavior. Set it to `1` only in a host's local configuration when
+that server should keep additional eight-card jobs pending without blocking
+later smaller jobs. Automatic updates preserve the local configuration and do
+not enable this policy elsewhere.
+
 `USAGE_SAMPLING_ENABLED` defaults to `false`; set it to `true` and rerun
 `setup.sh` to install and enable the independent usage-sampling timer.
 

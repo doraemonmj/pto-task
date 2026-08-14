@@ -119,6 +119,7 @@ credentials in it. The software does not store or print credentials.
 | Key | Default | Meaning |
 |---|---:|---|
 | `MAX_CONCURRENT` | `10` | Maximum simultaneously running jobs |
+| `MAX_CONCURRENT_8_CARD_TASKS` | `0` | Optional per-host limit for exactly eight-card jobs; `0` disables it |
 | `MAX_TIME_HARD_CAP` | `0` | Server maximum task duration; `0` means unlimited |
 | `KILL_GRACE` | `5` | Seconds from SIGTERM to SIGKILL |
 | `PTOAS_BASE` | `/usr/local/ptoas` | Default root containing installed PTOAS versions; submitter environment takes precedence |
@@ -127,6 +128,11 @@ credentials in it. The software does not store or print credentials.
 
 `STATE_DIR` and `LOGS_DIR` are set by the installer to the unified deployment
 tree. Do not point them at `/data` or a user home directory.
+
+`MAX_CONCURRENT_8_CARD_TASKS` is deliberately disabled by default. A host may
+set it to `1` in its preserved local `config/taskqueue.conf` to keep a second
+eight-card job pending while the daemon continues scheduling later smaller
+jobs. Code-only and automatic updates do not enable the policy on other hosts.
 
 ### Task execution identity
 
