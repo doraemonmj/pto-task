@@ -243,6 +243,7 @@ configured_values="$(bash -c 'source "$1"; printf "%s|%s|%s|%s|%s" \
 [[ "$(<"$INSTALL_ROOT/state/pending/sentinel")" == keep ]]
 
 bash "$REPO_DIR/tests/test_ptoas_option.sh"
+bash "$REPO_DIR/tests/test_device_policy.sh"
 
 # An administrator-selected legacy state path is prepared too, while the
 # complete unified installation tree continues to exist for application data.

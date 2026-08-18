@@ -78,6 +78,12 @@ parse_task_file() {
     DEVICE=""
     DEVICE_AUTO=0
     DEVICE_POOL=""
+    DEVICE_REQUEST_RAW=""
+    DEVICE_REQUEST_ORIGIN=""
+    DEVICE_SEQUENCE_SOURCE=""
+    DEVICE_POLICY_CONF=""
+    DEVICE_GLOBAL_POOL=""
+    DEVICE_GLOBAL_POOL_SOURCE=""
     MAX_TIME=300
     INTERACTIVE=0
     while IFS='=' read -r key value; do
@@ -89,6 +95,12 @@ parse_task_file() {
             DEVICE)      DEVICE="$value" ;;
             DEVICE_AUTO) DEVICE_AUTO="$value" ;;
             DEVICE_POOL) DEVICE_POOL="$value" ;;
+            DEVICE_REQUEST_RAW) DEVICE_REQUEST_RAW="$value" ;;
+            DEVICE_REQUEST_ORIGIN) DEVICE_REQUEST_ORIGIN="$value" ;;
+            DEVICE_SEQUENCE_SOURCE) DEVICE_SEQUENCE_SOURCE="$value" ;;
+            DEVICE_POLICY_CONF) DEVICE_POLICY_CONF="$value" ;;
+            DEVICE_GLOBAL_POOL) DEVICE_GLOBAL_POOL="$value" ;;
+            DEVICE_GLOBAL_POOL_SOURCE) DEVICE_GLOBAL_POOL_SOURCE="$value" ;;
             MAX_TIME)    MAX_TIME="$value" ;;
             INTERACTIVE) INTERACTIVE="$value" ;;
         esac
@@ -119,6 +131,13 @@ write_reject() {
 SUBMIT_USER=$SUBMIT_USER
 SUBMIT_TIME=$SUBMIT_TIME
 COMMAND=$COMMAND
+DEVICE=$DEVICE
+DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
+DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
+DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
+DEVICE_POLICY_CONF=$DEVICE_POLICY_CONF
+DEVICE_GLOBAL_POOL=$DEVICE_GLOBAL_POOL
+DEVICE_GLOBAL_POOL_SOURCE=$DEVICE_GLOBAL_POOL_SOURCE
 FINISH_TIME=$(date -Iseconds)
 EXIT_CODE=126
 EOF
@@ -426,17 +445,30 @@ finalize_interrupted() {
     local exit_code="${2:-137}"
     local rf="$RUNNING_DIR/$task_id"
     [ -f "$rf" ] || return 0
-    local submit_user submit_time command device start_time
+    local submit_user submit_time command device start_time request_raw request_origin
+    local sequence_source policy_conf global_pool global_pool_source
     submit_user=$(read_field SUBMIT_USER "$rf" || true)
     submit_time=$(read_field SUBMIT_TIME "$rf" || true)
     command=$(read_field COMMAND "$rf" || true)
     device=$(read_field DEVICE "$rf" || true)
     start_time=$(read_field START_TIME "$rf" || true)
+    request_raw=$(read_field DEVICE_REQUEST_RAW "$rf" || true)
+    request_origin=$(read_field DEVICE_REQUEST_ORIGIN "$rf" || true)
+    sequence_source=$(read_field DEVICE_SEQUENCE_SOURCE "$rf" || true)
+    policy_conf=$(read_field DEVICE_POLICY_CONF "$rf" || true)
+    global_pool=$(read_field DEVICE_GLOBAL_POOL "$rf" || true)
+    global_pool_source=$(read_field DEVICE_GLOBAL_POOL_SOURCE "$rf" || true)
     cat > "$DONE_DIR/$task_id" <<EOF
 SUBMIT_USER=$submit_user
 SUBMIT_TIME=$submit_time
 COMMAND=$command
 DEVICE=$device
+DEVICE_REQUEST_RAW=$request_raw
+DEVICE_REQUEST_ORIGIN=$request_origin
+DEVICE_SEQUENCE_SOURCE=$sequence_source
+DEVICE_POLICY_CONF=$policy_conf
+DEVICE_GLOBAL_POOL=$global_pool
+DEVICE_GLOBAL_POOL_SOURCE=$global_pool_source
 START_TIME=$start_time
 FINISH_TIME=$(date -Iseconds)
 EXIT_CODE=$exit_code
@@ -666,6 +698,12 @@ SUBMIT_USER=$SUBMIT_USER
 SUBMIT_TIME=$SUBMIT_TIME
 COMMAND=$COMMAND
 DEVICE=$DEVICE
+DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
+DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
+DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
+DEVICE_POLICY_CONF=$DEVICE_POLICY_CONF
+DEVICE_GLOBAL_POOL=$DEVICE_GLOBAL_POOL
+DEVICE_GLOBAL_POOL_SOURCE=$DEVICE_GLOBAL_POOL_SOURCE
 START_TIME=$start_iso
 FINISH_TIME=$(date -Iseconds)
 EXIT_CODE=$exit_code

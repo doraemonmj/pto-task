@@ -94,11 +94,17 @@ task-submit --wait <task-id>
 task-submit --cancel <task-id>
 task-submit --kill <task-id>
 pto-task --stats --days 7
+task-submit --devices status
 ```
 
 `--max-time` defaults to 300 seconds; `--timeout` defaults to 600 seconds and
 only controls client waiting. Project-local `task-submit.conf` device policies
 and the existing `TASKQUEUE_DEVICE_*` environment controls continue to work.
+`task-submit --devices status` reports every auto-pool source, the discovered
+project policy, the effective intersection used by the daemon, and conflicts
+such as fixed sequences outside the global auto pool. Runtime
+`state/available_devices` overrides configured `AVAILABLE_DEVICES`, which in
+turn overrides device detection.
 `--ptoas VERSION` validates `PTOAS_BASE/VERSION`, sets `PTOAS_ROOT`, and
 prepends both the version root and its `bin` directory to the submitted `PATH`.
 The root takes precedence so legacy wrapper scripts can configure their

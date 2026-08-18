@@ -148,12 +148,17 @@ task-submit --list                  # 所有任务
 task-submit --status <task-id>      # 单个任务状态
 task-submit --log <task-id>         # 任务日志
 task-submit --wait <task-id>        # 重新连上并跟到结束
-task-submit --devices               # 当前设备白名单
+task-submit --devices               # 当前 auto 白名单、来源、项目策略与冲突
 task-submit --find "<子串>"          # 按完整命令匹配，只输出 task-id（给脚本用）
 ```
 
 脚本里要定位任务请用 `--find`，不要解析 `--list`：`--list` 的命令列会在 77 个
 字符处截断。
+
+`task-submit --devices status` 会分别显示运行时 `available_devices`、服务器静态
+`AVAILABLE_DEVICES`、自动探测结果、`TASKQUEUE_DEVICE_POOL`，以及从当前目录向上
+找到的 `task-submit.conf`。输出还会计算 daemon 最终可分配的 auto 候选集合，并
+提示空交集、被全局池排除的卡和固定 `DEVICE_SEQ_N` 超出全局池等兼容行为。
 
 ## 管理
 

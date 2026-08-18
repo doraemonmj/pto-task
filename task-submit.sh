@@ -67,6 +67,16 @@ PTOAS_VERSION=""
 # （与全局白名单 available_devices 取交集，白名单为硬上限）
 DEVICE_POOL="${TASKQUEUE_DEVICE_POOL:-}"
 DEVICE_POOL="${DEVICE_POOL//[[:space:]]/}"
+ENV_DEVICE_POOL="$DEVICE_POOL"
+GLOBAL_AUTO_POOL=""
+GLOBAL_AUTO_POOL_SOURCE=""
+RUNTIME_AUTO_POOL=""
+CONFIG_AUTO_POOL="${AVAILABLE_DEVICES:-}"
+CONFIG_AUTO_POOL="${CONFIG_AUTO_POOL//[[:space:]]/}"
+DETECTED_AUTO_POOL=""
+DEVICE_REQUEST_RAW=""
+DEVICE_REQUEST_ORIGIN="none"
+DEVICE_SEQUENCE_SOURCE=""
 
 # 每仓设备策略配置文件（独立文件，仅影响 --device auto 自动选卡）
 # 发现方式：从当前目录逐级向上查找，命中第一个即用；可用 TASKQUEUE_DEVICE_CONF 显式指定路径
@@ -126,7 +136,8 @@ task-submit — 提交任务到 root 执行队列
   task-submit --find <子串>                     按完整命令匹配，只输出 task-id（供脚本/CI 用）
                                                --list 的命令列会被截断，不可用于脚本匹配
   task-submit --devices [list|reset|status]    查询/设置可用设备白名单
-                                               list 形如 "2,3,4,5"，reset 清除白名单
+                                               status/list 同时显示 auto 策略来源、交集与冲突
+                                               设备列表形如 "2,3,4,5"，reset 清除运行时覆盖
 
 选项:
   --timeout N     设置等待超时(秒)，可放在任意子命令前
@@ -321,6 +332,84 @@ show_eight_card_policy_notice() {
     fi
 }
 
+detect_auto_device_pool() {
+    local n
+    n=$(ls -1 /dev/davinci[0-9]* 2>/dev/null | wc -l)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    [[ $n -lt 1 ]] && n=2
+    seq -s, 0 $((n - 1))
+}
+
+# Resolve the same global auto-allocation pool as task-daemon:
+# runtime override > installed AVAILABLE_DEVICES > device detection.
+load_global_auto_pool() {
+    local include_detection_detail="${1:-0}"
+    local runtime_file="$STATE_DIR/available_devices"
+    RUNTIME_AUTO_POOL=""
+    [[ -f "$runtime_file" ]] && RUNTIME_AUTO_POOL="$(tr -d '[:space:]' < "$runtime_file" 2>/dev/null)"
+    DETECTED_AUTO_POOL=""
+    if [[ "$include_detection_detail" == "1" ||
+          ( -z "$RUNTIME_AUTO_POOL" && -z "$CONFIG_AUTO_POOL" ) ]]; then
+        DETECTED_AUTO_POOL="$(detect_auto_device_pool)"
+    fi
+
+    if [[ -n "$RUNTIME_AUTO_POOL" ]]; then
+        GLOBAL_AUTO_POOL="$RUNTIME_AUTO_POOL"
+        GLOBAL_AUTO_POOL_SOURCE="runtime:$runtime_file"
+    elif [[ -n "$CONFIG_AUTO_POOL" ]]; then
+        GLOBAL_AUTO_POOL="$CONFIG_AUTO_POOL"
+        GLOBAL_AUTO_POOL_SOURCE="config:$CONF_FILE"
+    else
+        GLOBAL_AUTO_POOL="$DETECTED_AUTO_POOL"
+        GLOBAL_AUTO_POOL_SOURCE="detected:/dev/davinci*"
+    fi
+}
+
+device_list_intersection() {
+    local left="$1" right="$2" item
+    local -a left_arr result=()
+    IFS=',' read -ra left_arr <<< "$left"
+    for item in "${left_arr[@]}"; do
+        [[ -n "$item" && ",$right," == *",$item,"* ]] && result+=("$item")
+    done
+    (IFS=,; echo "${result[*]}")
+}
+
+device_list_subtract() {
+    local base="$1" removed="$2" item
+    local -a base_arr result=()
+    IFS=',' read -ra base_arr <<< "$base"
+    for item in "${base_arr[@]}"; do
+        [[ -z "$item" ]] && continue
+        [[ -n "$removed" && ",$removed," == *",$item,"* ]] && continue
+        result+=("$item")
+    done
+    (IFS=,; echo "${result[*]}")
+}
+
+device_list_difference() {
+    local left="$1" right="$2"
+    device_list_subtract "$left" "$right"
+}
+
+device_list_count() {
+    local list="$1" item count=0
+    local -a items
+    local -A seen=()
+    IFS=',' read -ra items <<< "$list"
+    for item in "${items[@]}"; do
+        [[ -n "$item" && -z "${seen[$item]:-}" ]] || continue
+        seen["$item"]=1
+        count=$((count + 1))
+    done
+    echo "$count"
+}
+
+format_device_pool() {
+    local list="$1"
+    printf '[%s] (%s 张)' "$list" "$(device_list_count "$list")"
+}
+
 # 校验卡组（TASKQUEUE_DEVICE_POOL）：格式 + 与全局白名单是否有交集
 # 仅 --device auto 时才真正约束分配；提前拦截"卡组与白名单无交集 → 任务永远排队"
 validate_device_pool() {
@@ -331,10 +420,7 @@ validate_device_pool() {
         exit 1
     fi
     is_auto_device_request || return 0
-    local wl="$STATE_DIR/available_devices"
-    [[ -f "$wl" ]] || return 0
-    local allow
-    allow=$(tr -d '[:space:]' < "$wl" 2>/dev/null)
+    local allow="$GLOBAL_AUTO_POOL"
     [[ -z "$allow" ]] && return 0
     local p
     local -a _pool
@@ -343,7 +429,7 @@ validate_device_pool() {
         [[ ",$allow," == *",$p,"* ]] && return 0
     done
     echo "${C_RED}错误: 卡组 [$DEVICE_POOL] 与系统可用设备白名单 [$allow] 无交集，任务无法分配${C_RESET}" >&2
-    echo "${C_DIM}请调整 TASKQUEUE_DEVICE_POOL，或用 task-submit --devices status 查看白名单${C_RESET}" >&2
+    echo "${C_DIM}全局池来源: $GLOBAL_AUTO_POOL_SOURCE；请调整卡组，或用 task-submit --devices status 查看详情${C_RESET}" >&2
     exit 1
 }
 
@@ -385,6 +471,90 @@ load_device_conf() {
     DEVICE_CONF_PATH="$conf"
     CONF_WHITELIST="$(read_conf_field DEVICE_WHITELIST "$conf")"
     CONF_BLACKLIST="$(read_conf_field DEVICE_BLACKLIST "$conf")"
+}
+
+show_device_policy_sources() {
+    local runtime_file="$STATE_DIR/available_devices"
+    local base effective outside git_root seq_key seq outside_seq
+
+    echo ""
+    echo "${C_BOLD}=== Auto 设备策略来源 ===${C_RESET}"
+    if [[ -n "$RUNTIME_AUTO_POOL" ]]; then
+        echo "  ${C_GREEN}运行时覆盖${C_RESET} $(format_device_pool "$RUNTIME_AUTO_POOL")  $runtime_file"
+    else
+        echo "  ${C_DIM}运行时覆盖${C_RESET} 未设置  $runtime_file"
+    fi
+    if [[ -n "$CONFIG_AUTO_POOL" ]]; then
+        if [[ -n "$RUNTIME_AUTO_POOL" ]]; then
+            echo "  ${C_DIM}静态配置${C_RESET}   $(format_device_pool "$CONFIG_AUTO_POOL")  $CONF_FILE（被运行时覆盖）"
+        else
+            echo "  ${C_GREEN}静态配置${C_RESET}   $(format_device_pool "$CONFIG_AUTO_POOL")  $CONF_FILE"
+        fi
+    else
+        echo "  ${C_DIM}静态配置${C_RESET}   未设置  $CONF_FILE"
+    fi
+    if [[ "$GLOBAL_AUTO_POOL_SOURCE" == detected:* ]]; then
+        echo "  ${C_GREEN}自动探测${C_RESET}   $(format_device_pool "$DETECTED_AUTO_POOL")  /dev/davinci*"
+    else
+        echo "  ${C_DIM}自动探测${C_RESET}   $(format_device_pool "$DETECTED_AUTO_POOL")  /dev/davinci*（当前未采用）"
+    fi
+    echo "  ${C_BOLD}全局生效池${C_RESET} $(format_device_pool "$GLOBAL_AUTO_POOL")  来源=$GLOBAL_AUTO_POOL_SOURCE"
+
+    if [[ -n "$ENV_DEVICE_POOL" ]]; then
+        echo "  ${C_CYAN}环境卡组${C_RESET}   $(format_device_pool "$ENV_DEVICE_POOL")  TASKQUEUE_DEVICE_POOL"
+    else
+        echo "  ${C_DIM}环境卡组${C_RESET}   未设置"
+    fi
+
+    if [[ -n "$DEVICE_CONF_PATH" ]]; then
+        echo "  ${C_CYAN}仓库配置${C_RESET}   $DEVICE_CONF_PATH"
+        echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST")"
+        echo "    DEVICE_BLACKLIST=$(format_device_pool "$CONF_BLACKLIST")"
+        if git_root=$(git -C "$(pwd)" rev-parse --show-toplevel 2>/dev/null); then
+            case "$DEVICE_CONF_PATH" in
+                "$git_root"|"$git_root"/*) ;;
+                *) echo "  ${C_YELLOW}警告${C_RESET}: 配置位于当前 Git 仓库根目录之外，由向上搜索继承" ;;
+            esac
+        fi
+    elif [[ -n "${TASKQUEUE_DEVICE_CONF:-}" ]]; then
+        echo "  ${C_YELLOW}仓库配置${C_RESET}   显式路径不存在: $TASKQUEUE_DEVICE_CONF"
+    else
+        echo "  ${C_DIM}仓库配置${C_RESET}   从 $(pwd) 向上搜索，未找到 $DEVICE_CONF_NAME"
+    fi
+
+    # Preserve the existing policy precedence for compatibility. The daemon
+    # still intersects this task pool with GLOBAL_AUTO_POOL at allocation time.
+    if [[ "$IGNORE_WHITELIST" == "1" || -z "$CONF_WHITELIST" ]]; then
+        base="${ENV_DEVICE_POOL:-$GLOBAL_AUTO_POOL}"
+    else
+        base="$CONF_WHITELIST"
+        if [[ -n "$ENV_DEVICE_POOL" ]]; then
+            echo "  ${C_YELLOW}兼容提示${C_RESET}: 仓库白名单优先于 TASKQUEUE_DEVICE_POOL；当前未改动该历史行为"
+        fi
+    fi
+    base="$(device_list_subtract "$base" "$CONF_BLACKLIST")"
+    effective="$(device_list_intersection "$GLOBAL_AUTO_POOL" "$base")"
+    outside="$(device_list_difference "$base" "$GLOBAL_AUTO_POOL")"
+    echo "  ${C_BOLD}最终 auto 候选${C_RESET} $(format_device_pool "$effective")"
+    [[ -z "$outside" ]] || echo "  ${C_YELLOW}冲突${C_RESET}: 项目/环境策略中的 $(format_device_pool "$outside") 不在全局生效池，daemon 不会分配"
+    [[ -n "$effective" ]] || echo "  ${C_RED}冲突${C_RESET}: 各层策略交集为空，auto 任务无法获得设备"
+
+    if [[ -n "$DEVICE_CONF_PATH" ]]; then
+        while IFS= read -r seq_key; do
+            [[ -n "$seq_key" ]] || continue
+            seq="$(read_conf_field "$seq_key" "$DEVICE_CONF_PATH")"
+            outside_seq="$(device_list_difference "$seq" "$GLOBAL_AUTO_POOL")"
+            echo "    $seq_key=$(format_device_pool "$seq")"
+            if [[ -n "$outside_seq" ]]; then
+                echo "      ${C_YELLOW}兼容提示${C_RESET}: 其中 $(format_device_pool "$outside_seq") 超出全局 auto 池；固定序列当前仍按显式卡号语义提交"
+            fi
+        done < <(awk -F= '
+            /^[[:space:]]*DEVICE_SEQ_[0-9]+[[:space:]]*=/ {
+                key=$1; gsub(/[[:space:]]/, "", key)
+                if (!seen[key]++) print key
+            }
+        ' "$DEVICE_CONF_PATH")
+    fi
 }
 
 # 每仓“按卡数固定卡号序列”：--device auto --device-num N（含 --device-num N 单用）
@@ -465,6 +635,8 @@ apply_device_sequence() {
     # 命中且通过核对：转成显式卡号（精确锁）。清空 DEVICE_NUM 使其不再是 auto 请求，
     # 后续 apply_device_policy / validate_device_* 都会因非 auto 而自然跳过。
     echo "${C_DIM}提示: 命中每仓 DEVICE_SEQ_${n}，固定使用卡 [$seq]（精确锁，忽略 auto 选空闲；卡忙则排队等这几张）${C_RESET}" >&2
+    DEVICE_REQUEST_ORIGIN="sequence"
+    DEVICE_SEQUENCE_SOURCE="DEVICE_SEQ_${n}@$DEVICE_CONF_PATH"
     LOCK_DEVICE="$seq"
     DEVICE_NUM=""
 }
@@ -492,22 +664,14 @@ apply_device_policy() {
         fi
     done
 
-    # 候选基集：白名单 > 现有环境卡组 > 全局白名单文件 > 自动探测 /dev/davinci*
+    # 候选基集：白名单 > 现有环境卡组 > daemon 同口径的全局 auto 池。
     local base=""
     if [[ -n "$CONF_WHITELIST" ]]; then
         base="$CONF_WHITELIST"
     elif [[ -n "$DEVICE_POOL" ]]; then
         base="$DEVICE_POOL"
     else
-        local wl="$STATE_DIR/available_devices"
-        [[ -f "$wl" ]] && base="$(tr -d '[:space:]' < "$wl" 2>/dev/null)"
-        if [[ -z "$base" ]]; then
-            local n
-            n=$(ls -1 /dev/davinci[0-9]* 2>/dev/null | wc -l)
-            [[ "$n" =~ ^[0-9]+$ ]] || n=0
-            [[ $n -lt 1 ]] && n=2
-            base="$(seq -s, 0 $((n - 1)))"
-        fi
+        base="$GLOBAL_AUTO_POOL"
     fi
 
     # 扣除黑名单
@@ -535,19 +699,9 @@ validate_device_count() {
     local need="${DEVICE_NUM:-1}"
     is_positive_int "$need" || return 0
 
-    # 全局候选：available_devices 文件优先，否则自动探测 /dev/davinci*
+    # 全局候选与 daemon 完全一致。
     local -a global_arr=()
-    local wl="$STATE_DIR/available_devices" g=""
-    [[ -f "$wl" ]] && g="$(tr -d '[:space:]' < "$wl" 2>/dev/null)"
-    if [[ -n "$g" ]]; then
-        IFS=',' read -ra global_arr <<< "$g"
-    else
-        local n i
-        n=$(ls -1 /dev/davinci[0-9]* 2>/dev/null | wc -l)
-        [[ "$n" =~ ^[0-9]+$ ]] || n=0
-        [[ $n -lt 1 ]] && n=2
-        for ((i = 0; i < n; i++)); do global_arr+=("$i"); done
-    fi
+    IFS=',' read -ra global_arr <<< "$GLOBAL_AUTO_POOL"
 
     # 与卡组取交集（卡组为空则候选=全局）
     local -a cand=()
@@ -578,6 +732,17 @@ validate_device_count() {
 }
 
 normalize_device_request
+DEVICE_REQUEST_RAW="$(build_device_request)"
+if is_auto_device_request; then
+    DEVICE_REQUEST_ORIGIN="auto"
+elif [[ -n "$LOCK_DEVICE" && "$LOCK_DEVICE" != "none" ]]; then
+    DEVICE_REQUEST_ORIGIN="explicit"
+fi
+if [[ "${1:-}" == "--devices" ]]; then
+    load_global_auto_pool 1
+else
+    load_global_auto_pool 0
+fi
 load_device_conf
 apply_device_sequence
 apply_device_policy
@@ -723,6 +888,12 @@ COMMAND=$cmd
 DEVICE=$device_request
 DEVICE_AUTO=$(is_auto_device_request && echo 1 || echo 0)
 DEVICE_POOL=$DEVICE_POOL
+DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
+DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
+DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
+DEVICE_POLICY_CONF=$DEVICE_CONF_PATH
+DEVICE_GLOBAL_POOL=$GLOBAL_AUTO_POOL
+DEVICE_GLOBAL_POOL_SOURCE=$GLOBAL_AUTO_POOL_SOURCE
 MAX_TIME=$MAX_TIME
 INTERACTIVE=$([[ "$INTERACTIVE" == "true" ]] && echo 1 || echo 0)
 EOF
@@ -1109,8 +1280,9 @@ check_maintenance() {
 # 用法:
 #   task-submit --devices                  显示当前白名单
 #   task-submit --devices status           同上
+#   task-submit --devices list             同上（兼容别名）
 #   task-submit --devices "2,3,4,5"        设置白名单
-#   task-submit --devices reset            清除白名单（恢复自动探测）
+#   task-submit --devices reset            清除运行时覆盖（回退静态配置或自动探测）
 #
 # 写入/清除后通过 SIGHUP 通知 daemon 重新加载到内存，
 # 运行时零开销（daemon 不会每次分配设备都读文件）。
@@ -1131,22 +1303,27 @@ devices_cmd() {
     local action="${1:-status}"
 
     case "$action" in
-        ""|status)
+        ""|status|list)
             if [[ -f "$devices_file" ]]; then
                 local cur
                 cur=$(tr -d '[:space:]' < "$devices_file" 2>/dev/null)
                 if [[ -n "$cur" ]]; then
                     echo "${C_GREEN}当前可用设备白名单: ${cur}${C_RESET}"
+                elif [[ -n "$CONFIG_AUTO_POOL" ]]; then
+                    echo "${C_GREEN}当前可用设备白名单: ${CONFIG_AUTO_POOL}${C_RESET} ${C_DIM}(运行时文件为空，回退静态配置 $CONF_FILE)${C_RESET}"
                 else
                     echo "${C_DIM}白名单文件存在但为空，按自动探测处理${C_RESET}"
                 fi
+            elif [[ -n "$CONFIG_AUTO_POOL" ]]; then
+                echo "${C_GREEN}当前可用设备白名单: ${CONFIG_AUTO_POOL}${C_RESET} ${C_DIM}(静态配置 $CONF_FILE)${C_RESET}"
             else
                 echo "${C_DIM}未设置白名单（自动探测 /dev/davinci*）${C_RESET}"
             fi
+            show_device_policy_sources
             ;;
         reset|clear|none)
             if [[ ! -f "$devices_file" ]]; then
-                echo "${C_DIM}白名单未设置，无需清除${C_RESET}"
+                echo "${C_DIM}运行时白名单未设置，无需清除；当前使用 $GLOBAL_AUTO_POOL_SOURCE${C_RESET}"
                 return 0
             fi
             if ! rm -f "$devices_file" 2>/dev/null; then
@@ -1155,9 +1332,9 @@ devices_cmd() {
                 exit 1
             fi
             if notify_daemon_reload; then
-                echo "${C_GREEN}白名单已清除，已通知 daemon 重新加载${C_RESET}"
+                echo "${C_GREEN}运行时白名单已清除，已通知 daemon 回退到 ${CONFIG_AUTO_POOL:+静态配置 }${CONFIG_AUTO_POOL:-自动探测}${C_RESET}"
             else
-                echo "${C_GREEN}白名单已清除${C_RESET}"
+                echo "${C_GREEN}运行时白名单已清除，将回退到 ${CONFIG_AUTO_POOL:+静态配置 }${CONFIG_AUTO_POOL:-自动探测}${C_RESET}"
                 echo "${C_YELLOW}警告: 未能通知 daemon（可能未运行），重启 daemon 后生效${C_RESET}"
             fi
             ;;
