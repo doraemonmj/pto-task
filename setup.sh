@@ -87,6 +87,7 @@ done
 
 TOOL_ROOT="${TOOLS_ROOT%/}/$TOOL_NAME"
 APP_DIR="$TOOL_ROOT/app"
+SCHEDULER_APP_DIR="$APP_DIR/schedulers"
 CONFIG_DIR="$TOOL_ROOT/config"
 STATE_DIR="$TOOL_ROOT/state"
 LOGS_DIR="$TOOL_ROOT/logs"
@@ -406,7 +407,7 @@ fi
 # user-created symlink here could otherwise change metadata outside the
 # installation tree.
 if [[ "$(id -u)" -eq 0 ]]; then
-    for managed_dir in "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOGS_DIR" "$TMP_DIR"; do
+    for managed_dir in "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOGS_DIR" "$TMP_DIR"; do
         [[ ! -L "$managed_dir" ]] || {
             echo "error: managed installation directory must not be a symlink: $managed_dir" >&2
             exit 1
@@ -415,6 +416,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 ensure_dir 755 "$APP_DIR"
+ensure_dir 755 "$SCHEDULER_APP_DIR"
 ensure_dir 755 "$CONFIG_DIR"
 ensure_dir 755 "$LOGS_DIR"
 ensure_dir 755 "$TMP_DIR"
@@ -423,11 +425,12 @@ prepare_state_layout "$STATE_DIR"
 # Root system units execute files from APP_DIR, so keep the installed code
 # directories root-owned and non-writable by other users.
 if [[ "$(id -u)" -eq 0 ]]; then
-    chown root:root "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
-    chmod go-w "$TOOL_ROOT" "$APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
+    chown root:root "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
+    chmod go-w "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
 fi
 install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
 install_app_file "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon" 755
+install_app_file "$SCRIPT_DIR/schedulers/backfill.sh" "$SCHEDULER_APP_DIR/backfill.sh" 644
 install_app_file "$SCRIPT_DIR/npu_lock.sh" "$APP_DIR/npu_lock.sh" 755
 install_app_file "$SCRIPT_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update" 755
 install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.sh" "$APP_DIR/pto-task-usage-sampler" 755

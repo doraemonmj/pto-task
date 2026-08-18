@@ -68,6 +68,7 @@ run_enabled_case() {
 STATE_DIR="$state"
 LOGS_DIR="$logs"
 MAX_CONCURRENT=3
+SCHEDULER_MODE=backfill
 MAX_CONCURRENT_8_CARD_TASKS=1
 MAX_TIME_HARD_CAP=0
 TASK_EXECUTION_MODE=root
@@ -192,8 +193,34 @@ EOF
     DAEMON_PID=""
 }
 
+run_invalid_scheduler_case() {
+    local case_root="$TEST_ROOT/invalid-scheduler"
+    local config_dir="$case_root/config"
+    local config="$config_dir/taskqueue.conf"
+    local output
+    mkdir -p "$config_dir"
+    cat > "$config" <<EOF
+STATE_DIR="$case_root/state"
+LOGS_DIR="$case_root/logs"
+MAX_CONCURRENT=1
+SCHEDULER_MODE=not-a-policy
+TASK_EXECUTION_MODE=root
+EOF
+
+    if output=$(EIGHT_CARD_TEST_CONFIG_DIR="$config_dir" \
+        EIGHT_CARD_TEST_CONFIG="$config" TASKQUEUE_ALLOW_USER=1 \
+        TASKQUEUE_CONF="$config" PATH="$FAKE_BIN:$PATH" \
+        bash "$REPO_DIR/task-daemon.sh" 2>&1); then
+        echo 'error: daemon accepted an unknown scheduler mode' >&2
+        return 1
+    fi
+    grep -Fq "unsupported SCHEDULER_MODE 'not-a-policy'" <<< "$output"
+}
+
 grep -Fq 'MAX_CONCURRENT_8_CARD_TASKS=0' "$REPO_DIR/config/default.conf"
+grep -Fq 'SCHEDULER_MODE="backfill"' "$REPO_DIR/config/default.conf"
 run_enabled_case
 run_disabled_case
+run_invalid_scheduler_case
 
 echo 'eight-card limit tests passed'

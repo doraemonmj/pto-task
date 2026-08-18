@@ -41,6 +41,17 @@ sudo bash deploy.sh --max-concurrent 8 --available-devices 0,1,2,3 \
   --ptoas-base /usr/local/ptoas --task-execution-mode HwHiAiUser
 ```
 
+调度策略由 root 管理的独立模块提供。当前默认模式是 `backfill`，与历史行为
+一致：暂时无法获得设备的任务不会阻塞后面可运行的任务。可在本机配置中显式写：
+
+```bash
+SCHEDULER_MODE="backfill"
+```
+
+未知模式会导致 daemon 拒绝启动，不会静默切换策略。
+调度模式在 daemon 启动时读取；切换时应先等待 pending 和 running 队列为空，
+再重启服务，避免重启过程终止正在执行的任务。
+
 升级时若仍有任务运行，脚本不会杀任务，只更新程序文件并提示任务结束后重新执行。
 旧版 `/etc/taskqueue.conf` 中安全的 `BASE_DIR` 和 `MAX_CONCURRENT` 会自动迁移，
 `taskqueue.service` 也保留为 `pto-task.service` 的兼容名称。

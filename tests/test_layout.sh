@@ -23,6 +23,10 @@ INSTALL_ROOT="$TOOLS_ROOT/pto-task"
 [[ "$(readlink -f "$BIN_DIR/task-submit")" == "$INSTALL_ROOT/app/task-submit" ]]
 [[ "$(readlink -f "$BIN_DIR/pto-task")" == "$INSTALL_ROOT/app/task-submit" ]]
 [[ -x "$INSTALL_ROOT/app/task-submit" ]]
+[[ -f "$INSTALL_ROOT/app/schedulers/backfill.sh" ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers")" == 755 ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/backfill.sh")" == 644 ]]
+grep -Fqx 'SCHEDULER_MODULE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/backfill.sh"
 [[ -x "$INSTALL_ROOT/app/pto-task-stats" && -x "$INSTALL_ROOT/app/pto-task-usage-sampler" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task.service" && -f "$INSTALL_ROOT/app/pto-task-clean.cron" ]]
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/task-daemon" "$INSTALL_ROOT/app/pto-task.service"
@@ -48,6 +52,7 @@ for private_dir in running 'done' usage; do
     [[ "$(stat -c %a "$INSTALL_ROOT/state/$private_dir")" == 755 ]]
 done
 grep -q '^TASK_EXECUTION_MODE="HwHiAiUser"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
+grep -q '^SCHEDULER_MODE="backfill"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^PTOAS_BASE="/usr/local/ptoas"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^MAX_CONCURRENT_8_CARD_TASKS=0[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf"
@@ -58,12 +63,13 @@ grep -q '^AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200' "$INSTALL_ROOT/config/taskqueu
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 666 ]]
 if [[ "$(id -u)" -eq 0 ]]; then
     [[ "$(stat -c %u "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 0 ]]
-    for root_dir in "$INSTALL_ROOT" "$INSTALL_ROOT/app" "$INSTALL_ROOT/config" \
+    for root_dir in "$INSTALL_ROOT" "$INSTALL_ROOT/app" "$INSTALL_ROOT/app/schedulers" "$INSTALL_ROOT/config" \
         "$INSTALL_ROOT/state" "$INSTALL_ROOT/logs" "$INSTALL_ROOT/tmp" \
         "$INSTALL_ROOT/state/pending" "$INSTALL_ROOT/state/locks"; do
         [[ "$(stat -c '%U:%G' "$root_dir")" == root:root ]]
     done
     [[ -z "$(find "$INSTALL_ROOT/app" -maxdepth 1 -type f ! -user root -print -quit)" ]]
+    [[ -z "$(find "$INSTALL_ROOT/app/schedulers" -maxdepth 1 -type f ! -user root -print -quit)" ]]
     [[ "$(stat -c '%U:%G' "$INSTALL_ROOT/config/taskqueue.conf")" == root:root ]]
 
     leaf_target="$TEST_ROOT/managed-leaf-target"

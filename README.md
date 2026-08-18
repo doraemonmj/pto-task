@@ -42,7 +42,7 @@ The default installation is:
 
 ```text
 /home/pypto-tools/pto-task/
-├── app/       # deployed programs: task-submit, task-daemon, npu_lock.sh
+├── app/       # deployed programs and root-managed scheduler modules
 ├── config/    # local taskqueue.conf; never overwritten by an update
 ├── state/     # pending, running, done, locks, FIFO, usage and daemon state
 ├── logs/      # task and daemon logs
@@ -119,6 +119,7 @@ credentials in it. The software does not store or print credentials.
 | Key | Default | Meaning |
 |---|---:|---|
 | `MAX_CONCURRENT` | `10` | Maximum simultaneously running jobs |
+| `SCHEDULER_MODE` | `backfill` | Scheduler policy; `backfill` preserves historical behavior |
 | `MAX_CONCURRENT_8_CARD_TASKS` | `0` | Optional per-host limit for exactly eight-card jobs; `0` disables it |
 | `MAX_TIME_HARD_CAP` | `0` | Server maximum task duration; `0` means unlimited |
 | `KILL_GRACE` | `5` | Seconds from SIGTERM to SIGKILL |

@@ -40,6 +40,7 @@ LOG_FILE="$LOGS_DIR/taskqueue.log"
 POLL_INTERVAL=0.2
 KILL_GRACE=${KILL_GRACE:-5}   # --kill 后等待 SIGTERM 优雅退出的宽限期(秒)，超时升级到 SIGKILL
 MAX_CONCURRENT=${MAX_CONCURRENT:-1}
+SCHEDULER_MODE=${SCHEDULER_MODE:-backfill}
 # Optional per-host admission limit for jobs that request exactly eight cards.
 # Zero keeps historical scheduling behavior, so code updates do not enable the
 # policy on hosts whose preserved local configuration does not opt in.
@@ -683,6 +684,82 @@ log() {
     echo "[$(date -Iseconds)] $*" >> "$LOG_FILE"
 }
 
+# Claim and launch a task selected by the active scheduler. Policy modules do
+# not move queue files or start processes directly; this keeps the atomic state
+# transition and the in-tick resource accounting in daemon core.
+start_pending_task() {
+    local task_file="$1"
+    local task_id="$2"
+    local pending_dev="$3"
+    local pending_device_count="$4"
+
+    log "processing: $task_id"
+
+    if ! mv "$task_file" "$RUNNING_DIR/$task_id" 2>/dev/null; then
+        log "skip $task_id (already taken)"
+        return 1
+    fi
+    # Older clients may create task metadata with mode 600. Normalize it so
+    # every queue user can continue to inspect running tasks.
+    chmod 644 "$RUNNING_DIR/$task_id" 2>/dev/null || log "warning: cannot normalize permissions for $task_id"
+    [ -f "$PENDING_DIR/${task_id}.env" ] && mv "$PENDING_DIR/${task_id}.env" "$RUNNING_DIR/${task_id}.env" 2>/dev/null
+
+    # Resolve DEVICE only after the sticky-directory claim succeeds.
+    if [[ -n "$pending_dev" && "$pending_dev" != "none" ]]; then
+        sed -i "s/^DEVICE=.*/DEVICE=$pending_dev/" "$RUNNING_DIR/$task_id"
+        IN_USE_SET="$IN_USE_SET$pending_dev,"
+    fi
+
+    run_task "$task_id" &
+    JOB_PIDS+=($!)
+    CURRENT_JOBS=$((CURRENT_JOBS + 1))
+    if [[ "$pending_device_count" -eq 8 ]]; then
+        RUNNING_8_CARD_TASKS=$((RUNNING_8_CARD_TASKS + 1))
+    fi
+}
+
+load_scheduler() {
+    local scheduler_dir="$SCRIPT_DIR/schedulers"
+    local scheduler_module
+
+    case "$SCHEDULER_MODE" in
+        backfill) scheduler_module="$scheduler_dir/backfill.sh" ;;
+        *)
+            echo "error: unsupported SCHEDULER_MODE '$SCHEDULER_MODE'" >&2
+            return 1
+            ;;
+    esac
+
+    if [[ -L "$scheduler_dir" || -L "$scheduler_module" || ! -f "$scheduler_module" ]]; then
+        echo "error: scheduler module is missing or unsafe: $scheduler_module" >&2
+        return 1
+    fi
+
+    # Installed modules are executed by a root daemon and must be protected
+    # like the installed app. Source-checkout tests use a separate runtime
+    # layout and are intentionally not subject to installed-tree ownership.
+    if [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" && -z "${TASKQUEUE_ALLOW_USER:-}" ]]; then
+        if [[ "$(stat -c %u "$scheduler_dir")" -ne 0 ||
+              "$(stat -c %u "$scheduler_module")" -ne 0 ||
+              $((8#$(stat -c %a "$scheduler_dir") & 8#022)) -ne 0 ||
+              $((8#$(stat -c %a "$scheduler_module") & 8#022)) -ne 0 ]]; then
+            echo "error: scheduler module and its parent must be root-owned and not group/world-writable" >&2
+            return 1
+        fi
+    fi
+
+    unset SCHEDULER_MODULE_API_VERSION
+    # shellcheck source=/dev/null
+    source "$scheduler_module"
+    if [[ "${SCHEDULER_MODULE_API_VERSION:-}" != 1 ]] ||
+       ! declare -F scheduler_schedule_tick >/dev/null; then
+        echo "error: scheduler '$SCHEDULER_MODE' does not implement API version 1" >&2
+        return 1
+    fi
+}
+
+load_scheduler || exit 1
+
 # must run as root (或显式允许普通用户，用于本地测试)
 if [ "$(id -u)" -ne 0 ] && [ -z "${TASKQUEUE_ALLOW_USER:-}" ]; then
     echo "error: must run as root (set TASKQUEUE_ALLOW_USER=1 to run as current user)" >&2
@@ -704,6 +781,7 @@ mkdir -p "$FIFO_DIR"
 chmod 1777 "$FIFO_DIR" 2>/dev/null
 
 log "task-daemon started (pid=$$)"
+log "scheduler loaded: mode=$SCHEDULER_MODE api=$SCHEDULER_MODULE_API_VERSION"
 
 RUNNING=true
 cleanup() {
@@ -879,69 +957,7 @@ while $RUNNING; do
         continue
     fi
 
-    for task_file in "$PENDING_DIR"/task_*; do
-        [ -f "$task_file" ] || continue
-        # 跳过环境快照文件（task_xxx.env），只处理任务文件
-        [[ "$task_file" == *.env ]] && continue
-
-        if [[ $CURRENT_JOBS -ge $MAX_CONCURRENT ]]; then
-            log "concurrent limit ($MAX_CONCURRENT), deferring"
-            break
-        fi
-
-        task_id=$(basename "$task_file")
-
-        # 设备感知调度
-        pending_dev=$(read_field DEVICE "$task_file")
-        pending_device_count=$(device_request_count "$pending_dev")
-
-        # Host-local opt-in policy: an eight-card task that exceeds its
-        # dedicated concurrency cap stays pending. Continue (not break) so a
-        # blocked large task never prevents later smaller jobs from using the
-        # remaining devices.
-        if (( MAX_CONCURRENT_8_CARD_TASKS > 0 )) &&
-           [[ "$pending_device_count" -eq 8 ]] &&
-           (( RUNNING_8_CARD_TASKS >= MAX_CONCURRENT_8_CARD_TASKS )); then
-            continue
-        fi
-
-        # auto / auto:N 分配：仅查找空闲设备，不修改文件（卡组从任务文件读取，收窄分配范围）
-        if [[ "$pending_dev" == "auto" || "$pending_dev" == auto:* ]]; then
-            pending_dev=$(resolve_device_request "" "$task_id" "$pending_dev" "$(read_field DEVICE_POOL "$task_file")") || continue
-        fi
-
-        # none 或空 → 不检查设备冲突，直接调度
-        if [[ -n "$pending_dev" && "$pending_dev" != "none" ]] && any_device_in_use "$pending_dev"; then
-            log "defer $task_id: device $pending_dev in use"
-            continue
-        fi
-
-        log "processing: $task_id"
-
-        if ! mv "$task_file" "$RUNNING_DIR/$task_id" 2>/dev/null; then
-            log "skip $task_id (already taken)"
-            continue
-        fi
-        # 兼容尚未升级的客户端：严格 umask 创建的任务可能是 600，导致其他
-        # 用户执行 task-submit --list 时无法读取 running 元数据。
-        chmod 644 "$RUNNING_DIR/$task_id" 2>/dev/null || log "warning: cannot normalize permissions for $task_id"
-        # 同时迁移环境快照文件
-        [ -f "$PENDING_DIR/${task_id}.env" ] && mv "$PENDING_DIR/${task_id}.env" "$RUNNING_DIR/${task_id}.env" 2>/dev/null
-
-        # mv 成功后再写入分配的设备号（避免在 sticky-bit pending 目录 sed -i 竞态）
-        if [[ -n "$pending_dev" && "$pending_dev" != "none" ]]; then
-            sed -i "s/^DEVICE=.*/DEVICE=$pending_dev/" "$RUNNING_DIR/$task_id"
-            # 增量追加到 IN_USE_SET，使本轮后续的 any_device_in_use 立刻看到占用
-            IN_USE_SET="$IN_USE_SET$pending_dev,"
-        fi
-
-        run_task "$task_id" &
-        JOB_PIDS+=($!)
-        CURRENT_JOBS=$((CURRENT_JOBS + 1))
-        if [[ "$pending_device_count" -eq 8 ]]; then
-            RUNNING_8_CARD_TASKS=$((RUNNING_8_CARD_TASKS + 1))
-        fi
-    done
+    scheduler_schedule_tick
 
     sleep "$POLL_INTERVAL"
 done
