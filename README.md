@@ -102,7 +102,12 @@ only controls client waiting. Project-local `task-submit.conf` device policies
 and the existing `TASKQUEUE_DEVICE_*` environment controls continue to work.
 `task-submit --devices status` reports every auto-pool source, the discovered
 project policy, the effective intersection used by the daemon, and conflicts
-such as fixed sequences outside the global auto pool. Runtime
+such as fixed sequences outside the global auto pool. Malformed lists,
+duplicate device IDs, sequence-size mismatches, and blacklist violations are
+reported at the configuration source instead of being included in a computed
+candidate pool. Submitted task metadata preserves the original project
+whitelist/blacklist, environment pool, and `--ignore-whitelist` state through
+completion for later diagnosis. Runtime
 `state/available_devices` overrides configured `AVAILABLE_DEVICES`, which in
 turn overrides device detection.
 `--ptoas VERSION` validates `PTOAS_BASE/VERSION`, sets `PTOAS_ROOT`, and

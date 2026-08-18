@@ -82,6 +82,10 @@ parse_task_file() {
     DEVICE_REQUEST_ORIGIN=""
     DEVICE_SEQUENCE_SOURCE=""
     DEVICE_POLICY_CONF=""
+    DEVICE_POLICY_WHITELIST=""
+    DEVICE_POLICY_BLACKLIST=""
+    DEVICE_POLICY_IGNORE_WHITELIST=""
+    DEVICE_POLICY_ENV_POOL=""
     DEVICE_GLOBAL_POOL=""
     DEVICE_GLOBAL_POOL_SOURCE=""
     MAX_TIME=300
@@ -99,6 +103,10 @@ parse_task_file() {
             DEVICE_REQUEST_ORIGIN) DEVICE_REQUEST_ORIGIN="$value" ;;
             DEVICE_SEQUENCE_SOURCE) DEVICE_SEQUENCE_SOURCE="$value" ;;
             DEVICE_POLICY_CONF) DEVICE_POLICY_CONF="$value" ;;
+            DEVICE_POLICY_WHITELIST) DEVICE_POLICY_WHITELIST="$value" ;;
+            DEVICE_POLICY_BLACKLIST) DEVICE_POLICY_BLACKLIST="$value" ;;
+            DEVICE_POLICY_IGNORE_WHITELIST) DEVICE_POLICY_IGNORE_WHITELIST="$value" ;;
+            DEVICE_POLICY_ENV_POOL) DEVICE_POLICY_ENV_POOL="$value" ;;
             DEVICE_GLOBAL_POOL) DEVICE_GLOBAL_POOL="$value" ;;
             DEVICE_GLOBAL_POOL_SOURCE) DEVICE_GLOBAL_POOL_SOURCE="$value" ;;
             MAX_TIME)    MAX_TIME="$value" ;;
@@ -136,6 +144,10 @@ DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
 DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
 DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
 DEVICE_POLICY_CONF=$DEVICE_POLICY_CONF
+DEVICE_POLICY_WHITELIST=$DEVICE_POLICY_WHITELIST
+DEVICE_POLICY_BLACKLIST=$DEVICE_POLICY_BLACKLIST
+DEVICE_POLICY_IGNORE_WHITELIST=$DEVICE_POLICY_IGNORE_WHITELIST
+DEVICE_POLICY_ENV_POOL=$DEVICE_POLICY_ENV_POOL
 DEVICE_GLOBAL_POOL=$DEVICE_GLOBAL_POOL
 DEVICE_GLOBAL_POOL_SOURCE=$DEVICE_GLOBAL_POOL_SOURCE
 FINISH_TIME=$(date -Iseconds)
@@ -446,7 +458,8 @@ finalize_interrupted() {
     local rf="$RUNNING_DIR/$task_id"
     [ -f "$rf" ] || return 0
     local submit_user submit_time command device start_time request_raw request_origin
-    local sequence_source policy_conf global_pool global_pool_source
+    local sequence_source policy_conf policy_whitelist policy_blacklist policy_ignore_whitelist policy_env_pool
+    local global_pool global_pool_source
     submit_user=$(read_field SUBMIT_USER "$rf" || true)
     submit_time=$(read_field SUBMIT_TIME "$rf" || true)
     command=$(read_field COMMAND "$rf" || true)
@@ -456,6 +469,10 @@ finalize_interrupted() {
     request_origin=$(read_field DEVICE_REQUEST_ORIGIN "$rf" || true)
     sequence_source=$(read_field DEVICE_SEQUENCE_SOURCE "$rf" || true)
     policy_conf=$(read_field DEVICE_POLICY_CONF "$rf" || true)
+    policy_whitelist=$(read_field DEVICE_POLICY_WHITELIST "$rf" || true)
+    policy_blacklist=$(read_field DEVICE_POLICY_BLACKLIST "$rf" || true)
+    policy_ignore_whitelist=$(read_field DEVICE_POLICY_IGNORE_WHITELIST "$rf" || true)
+    policy_env_pool=$(read_field DEVICE_POLICY_ENV_POOL "$rf" || true)
     global_pool=$(read_field DEVICE_GLOBAL_POOL "$rf" || true)
     global_pool_source=$(read_field DEVICE_GLOBAL_POOL_SOURCE "$rf" || true)
     cat > "$DONE_DIR/$task_id" <<EOF
@@ -467,6 +484,10 @@ DEVICE_REQUEST_RAW=$request_raw
 DEVICE_REQUEST_ORIGIN=$request_origin
 DEVICE_SEQUENCE_SOURCE=$sequence_source
 DEVICE_POLICY_CONF=$policy_conf
+DEVICE_POLICY_WHITELIST=$policy_whitelist
+DEVICE_POLICY_BLACKLIST=$policy_blacklist
+DEVICE_POLICY_IGNORE_WHITELIST=$policy_ignore_whitelist
+DEVICE_POLICY_ENV_POOL=$policy_env_pool
 DEVICE_GLOBAL_POOL=$global_pool
 DEVICE_GLOBAL_POOL_SOURCE=$global_pool_source
 START_TIME=$start_time
@@ -702,6 +723,10 @@ DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
 DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
 DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
 DEVICE_POLICY_CONF=$DEVICE_POLICY_CONF
+DEVICE_POLICY_WHITELIST=$DEVICE_POLICY_WHITELIST
+DEVICE_POLICY_BLACKLIST=$DEVICE_POLICY_BLACKLIST
+DEVICE_POLICY_IGNORE_WHITELIST=$DEVICE_POLICY_IGNORE_WHITELIST
+DEVICE_POLICY_ENV_POOL=$DEVICE_POLICY_ENV_POOL
 DEVICE_GLOBAL_POOL=$DEVICE_GLOBAL_POOL
 DEVICE_GLOBAL_POOL_SOURCE=$DEVICE_GLOBAL_POOL_SOURCE
 START_TIME=$start_iso

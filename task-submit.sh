@@ -84,6 +84,8 @@ DEVICE_CONF_NAME="${TASKQUEUE_DEVICE_CONF_NAME:-task-submit.conf}"
 DEVICE_CONF_PATH=""
 CONF_WHITELIST=""
 CONF_BLACKLIST=""
+CONF_WHITELIST_RAW=""
+CONF_BLACKLIST_RAW=""
 
 # 白名单超限开关：置位后 --device auto 忽略每仓 DEVICE_WHITELIST 上限，
 # 回退到全局 available_devices（黑名单 DEVICE_BLACKLIST 仍然排除）。
@@ -405,6 +407,41 @@ device_list_count() {
     echo "$count"
 }
 
+device_list_is_valid() {
+    local list="$1"
+    [[ -z "$list" || "$list" =~ ^[0-9]+(,[0-9]+)*$ ]]
+}
+
+device_list_duplicates() {
+    local list="$1" item
+    local -a items duplicates=()
+    local -A seen=() reported=()
+    IFS=',' read -ra items <<< "$list"
+    for item in "${items[@]}"; do
+        [[ -n "$item" ]] || continue
+        if [[ -n "${seen[$item]:-}" && -z "${reported[$item]:-}" ]]; then
+            duplicates+=("$item")
+            reported["$item"]=1
+        fi
+        seen["$item"]=1
+    done
+    (IFS=,; echo "${duplicates[*]}")
+}
+
+show_device_list_health() {
+    local indent="$1" label="$2" list="$3" duplicates
+    [[ -n "$list" ]] || return 0
+    if ! device_list_is_valid "$list"; then
+        echo "${indent}${C_RED}INVALID${C_RESET}: $label 格式无效，应为逗号分隔的非负整数"
+        return 1
+    fi
+    duplicates="$(device_list_duplicates "$list")"
+    if [[ -n "$duplicates" ]]; then
+        echo "${indent}${C_YELLOW}警告${C_RESET}: $label 包含重复卡号 [$duplicates]"
+    fi
+    return 0
+}
+
 format_device_pool() {
     local list="$1"
     printf '[%s] (%s 张)' "$list" "$(device_list_count "$list")"
@@ -413,13 +450,13 @@ format_device_pool() {
 # 校验卡组（TASKQUEUE_DEVICE_POOL）：格式 + 与全局白名单是否有交集
 # 仅 --device auto 时才真正约束分配；提前拦截"卡组与白名单无交集 → 任务永远排队"
 validate_device_pool() {
+    is_auto_device_request || return 0
     [[ -z "$DEVICE_POOL" ]] && return 0
     if [[ ! "$DEVICE_POOL" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
         echo "${C_RED}错误: TASKQUEUE_DEVICE_POOL 格式无效: '$DEVICE_POOL'${C_RESET}" >&2
         echo "${C_DIM}应为逗号分隔的非负整数，如 TASKQUEUE_DEVICE_POOL=2,3,4,5${C_RESET}" >&2
         exit 1
     fi
-    is_auto_device_request || return 0
     local allow="$GLOBAL_AUTO_POOL"
     [[ -z "$allow" ]] && return 0
     local p
@@ -469,18 +506,24 @@ load_device_conf() {
     local conf
     conf="$(find_device_conf)" || return 0
     DEVICE_CONF_PATH="$conf"
-    CONF_WHITELIST="$(read_conf_field DEVICE_WHITELIST "$conf")"
-    CONF_BLACKLIST="$(read_conf_field DEVICE_BLACKLIST "$conf")"
+    CONF_WHITELIST_RAW="$(read_conf_field DEVICE_WHITELIST "$conf")"
+    CONF_BLACKLIST_RAW="$(read_conf_field DEVICE_BLACKLIST "$conf")"
+    CONF_WHITELIST="$CONF_WHITELIST_RAW"
+    CONF_BLACKLIST="$CONF_BLACKLIST_RAW"
 }
 
 show_device_policy_sources() {
     local runtime_file="$STATE_DIR/available_devices"
-    local base effective outside git_root seq_key seq outside_seq
+    local base effective outside git_root seq_key seq outside_seq seq_n duplicates
+    local base_valid=1
+    local runtime_valid=1 config_valid=1 detected_valid=1 global_valid=1
+    local env_valid=1 whitelist_valid=1 blacklist_valid=1
 
     echo ""
     echo "${C_BOLD}=== Auto 设备策略来源 ===${C_RESET}"
     if [[ -n "$RUNTIME_AUTO_POOL" ]]; then
         echo "  ${C_GREEN}运行时覆盖${C_RESET} $(format_device_pool "$RUNTIME_AUTO_POOL")  $runtime_file"
+        show_device_list_health "    " "运行时覆盖" "$RUNTIME_AUTO_POOL" || runtime_valid=0
     else
         echo "  ${C_DIM}运行时覆盖${C_RESET} 未设置  $runtime_file"
     fi
@@ -490,6 +533,7 @@ show_device_policy_sources() {
         else
             echo "  ${C_GREEN}静态配置${C_RESET}   $(format_device_pool "$CONFIG_AUTO_POOL")  $CONF_FILE"
         fi
+        show_device_list_health "    " "AVAILABLE_DEVICES" "$CONFIG_AUTO_POOL" || config_valid=0
     else
         echo "  ${C_DIM}静态配置${C_RESET}   未设置  $CONF_FILE"
     fi
@@ -498,18 +542,27 @@ show_device_policy_sources() {
     else
         echo "  ${C_DIM}自动探测${C_RESET}   $(format_device_pool "$DETECTED_AUTO_POOL")  /dev/davinci*（当前未采用）"
     fi
+    show_device_list_health "    " "自动探测设备列表" "$DETECTED_AUTO_POOL" || detected_valid=0
+    case "$GLOBAL_AUTO_POOL_SOURCE" in
+        runtime:*) global_valid="$runtime_valid" ;;
+        config:*) global_valid="$config_valid" ;;
+        detected:*) global_valid="$detected_valid" ;;
+    esac
     echo "  ${C_BOLD}全局生效池${C_RESET} $(format_device_pool "$GLOBAL_AUTO_POOL")  来源=$GLOBAL_AUTO_POOL_SOURCE"
 
     if [[ -n "$ENV_DEVICE_POOL" ]]; then
         echo "  ${C_CYAN}环境卡组${C_RESET}   $(format_device_pool "$ENV_DEVICE_POOL")  TASKQUEUE_DEVICE_POOL"
+        show_device_list_health "    " "TASKQUEUE_DEVICE_POOL" "$ENV_DEVICE_POOL" || env_valid=0
     else
         echo "  ${C_DIM}环境卡组${C_RESET}   未设置"
     fi
 
     if [[ -n "$DEVICE_CONF_PATH" ]]; then
         echo "  ${C_CYAN}仓库配置${C_RESET}   $DEVICE_CONF_PATH"
-        echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST")"
-        echo "    DEVICE_BLACKLIST=$(format_device_pool "$CONF_BLACKLIST")"
+        echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST_RAW")"
+        show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+        echo "    DEVICE_BLACKLIST=$(format_device_pool "$CONF_BLACKLIST_RAW")"
+        show_device_list_health "      " "DEVICE_BLACKLIST" "$CONF_BLACKLIST_RAW" || blacklist_valid=0
         if git_root=$(git -C "$(pwd)" rev-parse --show-toplevel 2>/dev/null); then
             case "$DEVICE_CONF_PATH" in
                 "$git_root"|"$git_root"/*) ;;
@@ -522,29 +575,67 @@ show_device_policy_sources() {
         echo "  ${C_DIM}仓库配置${C_RESET}   从 $(pwd) 向上搜索，未找到 $DEVICE_CONF_NAME"
     fi
 
-    # Preserve the existing policy precedence for compatibility. The daemon
-    # still intersects this task pool with GLOBAL_AUTO_POOL at allocation time.
-    if [[ "$IGNORE_WHITELIST" == "1" || -z "$CONF_WHITELIST" ]]; then
+    # Preserve the existing policy precedence for compatibility. Only require
+    # the selected base source to be valid: an invalid but overridden env pool,
+    # or a whitelist explicitly ignored by the user, does not affect allocation.
+    if [[ "$IGNORE_WHITELIST" == "1" || -z "$CONF_WHITELIST_RAW" ]]; then
         base="${ENV_DEVICE_POOL:-$GLOBAL_AUTO_POOL}"
+        [[ -z "$ENV_DEVICE_POOL" || "$env_valid" == "1" ]] || base_valid=0
     else
-        base="$CONF_WHITELIST"
+        base="$CONF_WHITELIST_RAW"
+        [[ "$whitelist_valid" == "1" ]] || base_valid=0
         if [[ -n "$ENV_DEVICE_POOL" ]]; then
             echo "  ${C_YELLOW}兼容提示${C_RESET}: 仓库白名单优先于 TASKQUEUE_DEVICE_POOL；当前未改动该历史行为"
         fi
     fi
-    base="$(device_list_subtract "$base" "$CONF_BLACKLIST")"
-    effective="$(device_list_intersection "$GLOBAL_AUTO_POOL" "$base")"
-    outside="$(device_list_difference "$base" "$GLOBAL_AUTO_POOL")"
-    echo "  ${C_BOLD}最终 auto 候选${C_RESET} $(format_device_pool "$effective")"
-    [[ -z "$outside" ]] || echo "  ${C_YELLOW}冲突${C_RESET}: 项目/环境策略中的 $(format_device_pool "$outside") 不在全局生效池，daemon 不会分配"
-    [[ -n "$effective" ]] || echo "  ${C_RED}冲突${C_RESET}: 各层策略交集为空，auto 任务无法获得设备"
+
+    if [[ "$global_valid" == "1" && "$base_valid" == "1" && "$blacklist_valid" == "1" ]]; then
+        base="$(device_list_subtract "$base" "$CONF_BLACKLIST_RAW")"
+        effective="$(device_list_intersection "$GLOBAL_AUTO_POOL" "$base")"
+        outside="$(device_list_difference "$base" "$GLOBAL_AUTO_POOL")"
+        echo "  ${C_BOLD}最终 auto 候选${C_RESET} $(format_device_pool "$effective")"
+        [[ -z "$outside" ]] || echo "  ${C_YELLOW}冲突${C_RESET}: 项目/环境策略中的 $(format_device_pool "$outside") 不在全局生效池，daemon 不会分配"
+        [[ -n "$effective" ]] || echo "  ${C_RED}冲突${C_RESET}: 各层策略交集为空，auto 任务无法获得设备"
+    else
+        echo "  ${C_RED}最终 auto 候选无法计算${C_RESET}: 请先修复上面的 INVALID 设备列表"
+    fi
 
     if [[ -n "$DEVICE_CONF_PATH" ]]; then
         while IFS= read -r seq_key; do
             [[ -n "$seq_key" ]] || continue
             seq="$(read_conf_field "$seq_key" "$DEVICE_CONF_PATH")"
-            outside_seq="$(device_list_difference "$seq" "$GLOBAL_AUTO_POOL")"
             echo "    $seq_key=$(format_device_pool "$seq")"
+            if ! device_list_is_valid "$seq"; then
+                echo "      ${C_RED}INVALID${C_RESET}: $seq_key 格式无效，应为逗号分隔的非负整数"
+                continue
+            fi
+            seq_n="${seq_key#DEVICE_SEQ_}"
+            if [[ "$(device_list_count "$seq")" -ne "$seq_n" ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: 配置了 $(device_list_count "$seq") 张不同的卡，但键名要求 $seq_n 张"
+            fi
+            duplicates="$(device_list_duplicates "$seq")"
+            if [[ -n "$duplicates" ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: 包含重复卡号 [$duplicates]"
+            fi
+            if [[ "$blacklist_valid" == "1" ]]; then
+                outside_seq="$(device_list_intersection "$seq" "$CONF_BLACKLIST_RAW")"
+                [[ -z "$outside_seq" ]] || echo "      ${C_RED}INVALID${C_RESET}: 包含黑名单卡 $(format_device_pool "$outside_seq")"
+            fi
+            if [[ "$whitelist_valid" == "1" && -n "$CONF_WHITELIST_RAW" ]]; then
+                outside_seq="$(device_list_difference "$seq" "$CONF_WHITELIST_RAW")"
+                if [[ -n "$outside_seq" ]]; then
+                    if [[ "$IGNORE_WHITELIST" == "1" ]]; then
+                        echo "      ${C_YELLOW}兼容提示${C_RESET}: 其中 $(format_device_pool "$outside_seq") 超出仓库白名单，当前由 --ignore-whitelist 放行"
+                    else
+                        echo "      ${C_RED}冲突${C_RESET}: 其中 $(format_device_pool "$outside_seq") 超出仓库白名单；提交此固定序列会失败"
+                    fi
+                fi
+            fi
+            if [[ "$global_valid" == "1" ]]; then
+                outside_seq="$(device_list_difference "$seq" "$GLOBAL_AUTO_POOL")"
+            else
+                outside_seq=""
+            fi
             if [[ -n "$outside_seq" ]]; then
                 echo "      ${C_YELLOW}兼容提示${C_RESET}: 其中 $(format_device_pool "$outside_seq") 超出全局 auto 池；固定序列当前仍按显式卡号语义提交"
             fi
@@ -892,6 +983,10 @@ DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
 DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
 DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
 DEVICE_POLICY_CONF=$DEVICE_CONF_PATH
+DEVICE_POLICY_WHITELIST=$CONF_WHITELIST_RAW
+DEVICE_POLICY_BLACKLIST=$CONF_BLACKLIST_RAW
+DEVICE_POLICY_IGNORE_WHITELIST=$IGNORE_WHITELIST
+DEVICE_POLICY_ENV_POOL=$ENV_DEVICE_POOL
 DEVICE_GLOBAL_POOL=$GLOBAL_AUTO_POOL
 DEVICE_GLOBAL_POOL_SOURCE=$GLOBAL_AUTO_POOL_SOURCE
 MAX_TIME=$MAX_TIME
