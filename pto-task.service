@@ -15,4 +15,11 @@ ProtectHome=no
 
 [Install]
 WantedBy=multi-user.target
-Alias=taskqueue.service
+# No Alias= here on purpose. This unit is installed by symlinking it from
+# outside the systemd search path (/home/pypto-tools/pto-task/app), so an
+# Alias= symlink would point at that external path too -- and systemd only
+# collapses an alias whose link target names another unit inside the search
+# path. Two external symlinks read as two independent units, and the second
+# one crash-loops against the daemon's single-instance lock. setup.sh installs
+# the taskqueue.service compatibility alias as a symlink to
+# /etc/systemd/system/pto-task.service instead.
