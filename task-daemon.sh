@@ -288,43 +288,7 @@ resolve_device_request() {
 find_free_devices() {
     local need="${1:-1}"
     local pool="${2:-}"
-    local -a candidates
-    local -a selected=()
-    if [[ -n "${RUNTIME_DEVICES:-}" ]]; then
-        IFS=',' read -ra candidates <<< "$RUNTIME_DEVICES"
-    elif [[ -n "${AVAILABLE_DEVICES:-}" ]]; then
-        IFS=',' read -ra candidates <<< "$AVAILABLE_DEVICES"
-    else
-        local num
-        num=$(detect_device_count)
-        candidates=($(seq 0 $((num-1))))
-    fi
-    # 与任务卡组取交集：卡组只能收窄候选，不能突破全局白名单
-    if [[ -n "$pool" ]]; then
-        local -a pool_arr filtered=()
-        local c p
-        IFS=',' read -ra pool_arr <<< "$pool"
-        for c in "${candidates[@]}"; do
-            for p in "${pool_arr[@]}"; do
-                if [[ "$c" == "$p" ]]; then
-                    filtered+=("$c")
-                    break
-                fi
-            done
-        done
-        candidates=("${filtered[@]}")
-    fi
-    for id in "${candidates[@]}"; do
-        [[ -z "$id" ]] && continue
-        any_device_in_use "$id" || selected+=("$id")
-        if [[ ${#selected[@]} -ge $need ]]; then
-            local joined
-            joined=$(IFS=,; echo "${selected[*]}")
-            echo "$joined"
-            return 0
-        fi
-    done
-    return 1
+    scheduler_find_free_devices "$need" "$pool" ""
 }
 
 # 加载运行时设备白名单到内存（启动时和收到 SIGHUP 时调用）
@@ -783,41 +747,66 @@ start_pending_task() {
 
 load_scheduler() {
     local scheduler_dir="$SCRIPT_DIR/schedulers"
-    local scheduler_module
+    local scheduler_core="$scheduler_dir/_core.sh"
+    local scheduler_module path
 
-    case "$SCHEDULER_MODE" in
-        backfill) scheduler_module="$scheduler_dir/backfill.sh" ;;
-        pool_aware_reservation) scheduler_module="$scheduler_dir/pool_aware_reservation.sh" ;;
-        *)
-            echo "error: unsupported SCHEDULER_MODE '$SCHEDULER_MODE'" >&2
-            return 1
-            ;;
-    esac
-
-    if [[ -L "$scheduler_dir" || -L "$scheduler_module" || ! -f "$scheduler_module" ]]; then
-        echo "error: scheduler module is missing or unsafe: $scheduler_module" >&2
+    # A mode is an identifier, never a path. The leading-underscore core file
+    # therefore cannot be selected, while adding a policy no longer requires a
+    # daemon case statement change.
+    if [[ ! "$SCHEDULER_MODE" =~ ^[a-z][a-z0-9_]*$ ]]; then
+        echo "error: unsupported SCHEDULER_MODE '$SCHEDULER_MODE'" >&2
         return 1
     fi
+    scheduler_module="$scheduler_dir/$SCHEDULER_MODE.sh"
+
+    if [[ -L "$scheduler_dir" || ! -d "$scheduler_dir" ]]; then
+        echo "error: scheduler module directory is missing or unsafe: $scheduler_dir" >&2
+        return 1
+    fi
+    for path in "$scheduler_core" "$scheduler_module"; do
+        if [[ -L "$path" || ! -f "$path" ]]; then
+            echo "error: unsupported SCHEDULER_MODE '$SCHEDULER_MODE'" >&2
+            return 1
+        fi
+    done
 
     # Installed modules are executed by a root daemon and must be protected
     # like the installed app. Source-checkout tests use a separate runtime
     # layout and are intentionally not subject to installed-tree ownership.
     if [[ -f "$SCRIPT_DIR/../config/taskqueue.conf" && -z "${TASKQUEUE_ALLOW_USER:-}" ]]; then
         if [[ "$(stat -c %u "$scheduler_dir")" -ne 0 ||
-              "$(stat -c %u "$scheduler_module")" -ne 0 ||
-              $((8#$(stat -c %a "$scheduler_dir") & 8#022)) -ne 0 ||
-              $((8#$(stat -c %a "$scheduler_module") & 8#022)) -ne 0 ]]; then
+              $((8#$(stat -c %a "$scheduler_dir") & 8#022)) -ne 0 ]]; then
             echo "error: scheduler module and its parent must be root-owned and not group/world-writable" >&2
             return 1
         fi
+        for path in "$scheduler_core" "$scheduler_module"; do
+            if [[ "$(stat -c %u "$path")" -ne 0 ||
+                  $((8#$(stat -c %a "$path") & 8#022)) -ne 0 ]]; then
+                echo "error: scheduler module and its parent must be root-owned and not group/world-writable" >&2
+                return 1
+            fi
+        done
     fi
 
-    unset SCHEDULER_MODULE_API_VERSION
+    unset SCHEDULER_CORE_API_VERSION
+    # shellcheck source=schedulers/_core.sh
+    source "$scheduler_core"
+    if [[ "${SCHEDULER_CORE_API_VERSION:-}" != 1 ]] ||
+       ! declare -F scheduler_schedule_tick >/dev/null ||
+       ! declare -F scheduler_plan_start >/dev/null; then
+        echo "error: scheduler core does not implement API version 1" >&2
+        return 1
+    fi
+
+    unset -f scheduler_validate_config scheduler_begin_tick scheduler_consider_task scheduler_end_tick \
+        scheduler_task_started 2>/dev/null || true
+    unset SCHEDULER_MODULE_API_VERSION SCHEDULER_MODULE_NAME
     # shellcheck source=/dev/null
     source "$scheduler_module"
-    if [[ "${SCHEDULER_MODULE_API_VERSION:-}" != 1 ]] ||
-       ! declare -F scheduler_schedule_tick >/dev/null; then
-        echo "error: scheduler '$SCHEDULER_MODE' does not implement API version 1" >&2
+    if [[ "${SCHEDULER_MODULE_API_VERSION:-}" != 2 ]] ||
+       [[ "${SCHEDULER_MODULE_NAME:-}" != "$SCHEDULER_MODE" ]] ||
+       ! declare -F scheduler_consider_task >/dev/null; then
+        echo "error: scheduler '$SCHEDULER_MODE' does not implement API version 2" >&2
         return 1
     fi
     if declare -F scheduler_validate_config >/dev/null && ! scheduler_validate_config; then

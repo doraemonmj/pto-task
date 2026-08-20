@@ -429,9 +429,16 @@ if [[ "$(id -u)" -eq 0 ]]; then
     chmod go-w "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
 fi
 install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
+# Install the shared core first, then policies, and replace the daemon last.
+# Policy modules retain an API-v1 upgrade bridge, so every intermediate state
+# remains restartable if a file-by-file installation is interrupted.
+install_app_file "$SCRIPT_DIR/schedulers/_core.sh" "$SCHEDULER_APP_DIR/_core.sh" 644
+for scheduler_source in "$SCRIPT_DIR"/schedulers/*.sh; do
+    [[ -f "$scheduler_source" ]] || continue
+    [[ "$(basename "$scheduler_source")" != _core.sh ]] || continue
+    install_app_file "$scheduler_source" "$SCHEDULER_APP_DIR/$(basename "$scheduler_source")" 644
+done
 install_app_file "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon" 755
-install_app_file "$SCRIPT_DIR/schedulers/backfill.sh" "$SCHEDULER_APP_DIR/backfill.sh" 644
-install_app_file "$SCRIPT_DIR/schedulers/pool_aware_reservation.sh" "$SCHEDULER_APP_DIR/pool_aware_reservation.sh" 644
 install_app_file "$SCRIPT_DIR/npu_lock.sh" "$APP_DIR/npu_lock.sh" 755
 install_app_file "$SCRIPT_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update" 755
 install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.sh" "$APP_DIR/pto-task-usage-sampler" 755

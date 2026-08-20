@@ -63,10 +63,28 @@ the scheduler:
    real tasks alone acquire `npu_lock.sh`. Do not describe this policy as strict
    FIFO, preemption, or a physical device lock.
 
-The policy module is `app/schedulers/pool_aware_reservation.sh` after install
-and `schedulers/pool_aware_reservation.sh` in a checkout. Keep task claiming,
-atomic state transitions, process launch, and in-tick resource accounting in
-daemon core through `start_pending_task()`.
+The shared planning framework is `app/schedulers/_core.sh` after install and
+`schedulers/_core.sh` in a checkout. It owns pending traversal, task resource
+snapshots, common host admission, decision validation, and the final call to
+`start_pending_task()`. Selectable policies remain separate files such as
+`backfill.sh` and `pool_aware_reservation.sh`; they must not move queue files or
+launch processes.
+
+Scheduler modules use API version 2. A module named `<mode>.sh` must declare
+`SCHEDULER_MODULE_API_VERSION=2`, set `SCHEDULER_MODULE_NAME=<mode>`, and
+implement `scheduler_consider_task`. It returns one `start`, `defer`, or `stop`
+decision using the core helpers. Optional hooks are
+`scheduler_validate_config`, `scheduler_begin_tick`, `scheduler_end_tick`, and
+`scheduler_task_started`. Safe lowercase mode identifiers are discovered from
+root-managed files, and `setup.sh` installs all repository scheduler files, so
+do not add a daemon-side scheduler-name case statement. The leading-underscore
+core is intentionally not selectable.
+
+When extending scheduling, put device-pool intersection, allocation validation,
+queue mutation, and host-wide hard limits in `_core.sh`; put ordering,
+reservation, priority, or backfill choices in the policy module. Add new common
+invariants to `tests/test_scheduler_core.sh` and policy behavior to a dedicated
+integration test.
 
 ## Operate safely
 

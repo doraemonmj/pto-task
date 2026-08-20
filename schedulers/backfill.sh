@@ -1,49 +1,41 @@
 # Existing opportunistic backfill policy.
 #
-# Scheduler modules are sourced once by task-daemon. They may choose which
-# pending task to try, but claiming the task and starting it remain daemon-core
-# responsibilities through start_pending_task().
+# The shared scheduler core traverses pending tasks and owns all queue mutation.
+# This policy only decides whether the current task can start with the current
+# resource snapshot; blocked tasks do not prevent younger tasks from backfilling.
 
-SCHEDULER_MODULE_API_VERSION=1
+# Upgrade bridge: an API-v1 daemon does not preload _core.sh. Source the new
+# core locally and advertise v1 so an interrupted file-by-file installation
+# still leaves a runnable scheduler. The API-v2 daemon preloads and validates
+# the same root-managed core before sourcing this module.
+if [[ "${SCHEDULER_CORE_API_VERSION:-}" == 1 ]]; then
+    SCHEDULER_MODULE_API_VERSION=2
+else
+    # shellcheck source=_core.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_core.sh"
+    SCHEDULER_MODULE_API_VERSION=1
+fi
+SCHEDULER_MODULE_NAME=backfill
 
-scheduler_schedule_tick() {
-    local task_file task_id pending_dev pending_device_count device_pool
+scheduler_consider_task() {
+    local task_file="$1" task_id="$2" pending_request="$3"
+    local pending_device_count="$4" device_pool="$5"
+    local assigned="$pending_request"
 
-    for task_file in "$PENDING_DIR"/task_*; do
-        [ -f "$task_file" ] || continue
-        # Environment snapshots live beside task files but are not queue items.
-        [[ "$task_file" == *.env ]] && continue
+    # Resolve auto requests against the current in-memory device snapshot. The
+    # pending file remains untouched until daemon core validates and claims it.
+    if [[ "$pending_request" == auto || "$pending_request" == auto:* ]]; then
+        assigned=$(resolve_device_request "" "$task_id" "$pending_request" "$device_pool") || {
+            scheduler_plan_defer no_free_device
+            return
+        }
+    fi
 
-        if [[ $CURRENT_JOBS -ge $MAX_CONCURRENT ]]; then
-            log "concurrent limit ($MAX_CONCURRENT), deferring"
-            break
-        fi
+    if [[ -n "$assigned" && "$assigned" != none ]] && any_device_in_use "$assigned"; then
+        log "defer $task_id: device $assigned in use"
+        scheduler_plan_defer device_in_use
+        return
+    fi
 
-        task_id=$(basename "$task_file")
-        pending_dev=$(read_field DEVICE "$task_file")
-        pending_device_count=$(device_request_count "$pending_dev")
-
-        # Preserve the host-local eight-card admission policy. A blocked large
-        # task does not prevent later smaller tasks from backfilling.
-        if (( MAX_CONCURRENT_8_CARD_TASKS > 0 )) &&
-           [[ "$pending_device_count" -eq 8 ]] &&
-           (( RUNNING_8_CARD_TASKS >= MAX_CONCURRENT_8_CARD_TASKS )); then
-            continue
-        fi
-
-        # Resolve auto requests against the current in-memory device snapshot.
-        # The pending file remains untouched until daemon core claims it.
-        if [[ "$pending_dev" == "auto" || "$pending_dev" == auto:* ]]; then
-            device_pool=$(read_field DEVICE_POOL "$task_file")
-            pending_dev=$(resolve_device_request "" "$task_id" "$pending_dev" "$device_pool") || continue
-        fi
-
-        if [[ -n "$pending_dev" && "$pending_dev" != "none" ]] &&
-           any_device_in_use "$pending_dev"; then
-            log "defer $task_id: device $pending_dev in use"
-            continue
-        fi
-
-        start_pending_task "$task_file" "$task_id" "$pending_dev" "$pending_device_count" || continue
-    done
+    scheduler_plan_start "$assigned" runnable
 }
