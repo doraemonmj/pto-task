@@ -158,6 +158,27 @@ impossible `auto:N` requests do not become queue barriers. Select the mode in
 the preserved local configuration and restart the daemon while the queue is
 idle.
 
+### Scheduler module architecture
+
+Scheduling uses a shared planning core plus independently selectable policy
+modules. `schedulers/_core.sh` owns FIFO traversal, the per-task resource
+snapshot, host admission limits, decision validation, and the final call into
+the daemon's atomic claim/start path. A policy such as `backfill.sh` or
+`pool_aware_reservation.sh` may only return `start`, `defer`, or `stop` through
+the core decision helpers; it does not move queue files or launch processes.
+Every `start` is revalidated immediately before claim, including device count,
+effective auto pool, current occupancy, and concurrency caps.
+
+Policy modules implement API version 2, declare a matching
+`SCHEDULER_MODULE_NAME`, and provide `scheduler_consider_task`. Optional hooks
+are `scheduler_validate_config`, `scheduler_begin_tick`,
+`scheduler_end_tick`, and `scheduler_task_started`. Safe lowercase identifiers
+are resolved to root-managed `schedulers/<mode>.sh` files, so adding a policy
+does not require changing a daemon-side name list; `setup.sh` installs all
+repository scheduler files. The leading-underscore core cannot be selected as
+a mode. Installed scheduler files and their directory must remain root-owned
+and not group/world-writable.
+
 ### Task execution identity
 
 The daemon itself must run as root to schedule work. By default,

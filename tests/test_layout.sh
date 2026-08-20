@@ -23,13 +23,16 @@ INSTALL_ROOT="$TOOLS_ROOT/pto-task"
 [[ "$(readlink -f "$BIN_DIR/task-submit")" == "$INSTALL_ROOT/app/task-submit" ]]
 [[ "$(readlink -f "$BIN_DIR/pto-task")" == "$INSTALL_ROOT/app/task-submit" ]]
 [[ -x "$INSTALL_ROOT/app/task-submit" ]]
+[[ -f "$INSTALL_ROOT/app/schedulers/_core.sh" ]]
 [[ -f "$INSTALL_ROOT/app/schedulers/backfill.sh" ]]
 [[ -f "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh" ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers")" == 755 ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/_core.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/backfill.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh")" == 644 ]]
-grep -Fqx 'SCHEDULER_MODULE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/backfill.sh"
-grep -Fqx 'SCHEDULER_MODULE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh"
+grep -Fqx 'SCHEDULER_CORE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/_core.sh"
+grep -Eq '^[[:space:]]*SCHEDULER_MODULE_API_VERSION=2$' "$INSTALL_ROOT/app/schedulers/backfill.sh"
+grep -Eq '^[[:space:]]*SCHEDULER_MODULE_API_VERSION=2$' "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh"
 [[ -x "$INSTALL_ROOT/app/pto-task-stats" && -x "$INSTALL_ROOT/app/pto-task-usage-sampler" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task.service" && -f "$INSTALL_ROOT/app/pto-task-clean.cron" ]]
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/task-daemon" "$INSTALL_ROOT/app/pto-task.service"
@@ -375,6 +378,7 @@ fi
 bash "$REPO_DIR/tests/test_auto_update_retry.sh"
 bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
 bash "$REPO_DIR/tests/test_eight_card_limit.sh"
+bash "$REPO_DIR/tests/test_scheduler_core.sh"
 bash "$REPO_DIR/tests/test_pool_aware_reservation.sh"
 
 echo 'layout tests passed'

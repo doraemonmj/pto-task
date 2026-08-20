@@ -68,6 +68,17 @@ POOL_AWARE_RESERVATION_MIN_DEVICES=2
 调度模式在 daemon 启动时读取；切换时应先等待 pending 和 running 队列为空，
 再重启服务，避免重启过程终止正在执行的任务。
 
+调度实现由公共规划核心 `schedulers/_core.sh` 和独立策略模块组成。公共核心统一
+遍历 pending 队列、读取任务设备快照、执行 8 卡与总并发限制，并在真正认领任务前
+重新校验设备数、有效卡池和当前占用；策略模块只通过 `start`、`defer`、`stop`
+返回决策，不能移动队列文件或启动进程。当前两个策略都使用模块 API v2。
+
+新增策略只需增加安全命名的 `schedulers/<模式名>.sh`，声明
+`SCHEDULER_MODULE_API_VERSION=2`、与文件名一致的 `SCHEDULER_MODULE_NAME`，并实现
+`scheduler_consider_task`；安装脚本会自动安装仓库中的调度文件，不需要修改 daemon
+的模式列表。公共 `_core.sh` 不是可选调度模式。所有已安装调度文件继续要求由 root
+拥有且不能被组或其他用户写入。
+
 升级时若仍有任务运行，脚本不会杀任务，只更新程序文件并提示任务结束后重新执行。
 旧版 `/etc/taskqueue.conf` 中安全的 `BASE_DIR` 和 `MAX_CONCURRENT` 会自动迁移，
 `taskqueue.service` 也保留为 `pto-task.service` 的兼容名称。
