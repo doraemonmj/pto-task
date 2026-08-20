@@ -568,8 +568,32 @@ if [[ -f "$CONFIG_FILE" && "$(id -u)" -eq 0 ]]; then
     usage_sampling_enabled="$(bash -c 'source "$1"; printf "%s" "${USAGE_SAMPLING_ENABLED:-false}"' _ "$CONFIG_FILE")"
     install -d -m 755 /etc/systemd/system
     ln -sfn "$APP_DIR/pto-task.service" /etc/systemd/system/pto-task.service
+    # Upgrade path: earlier installs pointed taskqueue.service at the same
+    # external file as pto-task.service, which systemd loads as a second,
+    # independent unit that restart-loops against the daemon's single-instance
+    # lock. Retire that duplicate before relinking. Guard on both conditions:
+    # an Id that still reads back as taskqueue.service means systemd has not
+    # collapsed it into an alias yet, and an active pto-task.service means the
+    # real daemon lives there -- on a pre-migration host taskqueue.service is
+    # still the canonical unit running the daemon and must not be stopped.
+    if [[ "$(systemctl show -p Id --value taskqueue.service 2>/dev/null)" == taskqueue.service ]] &&
+       systemctl is-active --quiet pto-task.service; then
+        # Abort rather than relink underneath a duplicate that is still loaded:
+        # rewriting the symlink would leave the old unit running or
+        # restart-looping while systemd resolves the name somewhere else.
+        if ! systemctl stop taskqueue.service; then
+            echo 'error: could not stop the duplicate taskqueue.service unit' >&2
+            exit 1
+        fi
+        systemctl reset-failed taskqueue.service >/dev/null 2>&1 || true
+    fi
     # Keep the historical service name as a systemd alias during migration.
-    ln -sfn "$APP_DIR/pto-task.service" /etc/systemd/system/taskqueue.service
+    # The link target must be the unit *inside* the search path, not
+    # "$APP_DIR/pto-task.service": systemd only recognizes an alias when the
+    # symlink names another unit it already knows. Pointing both names at the
+    # same external file instead loads two independent units, and the extra one
+    # restart-loops forever against the daemon's single-instance lock.
+    ln -sfn /etc/systemd/system/pto-task.service /etc/systemd/system/taskqueue.service
     if [[ "$ENABLE_AUTO_UPDATE" == true ]]; then
         ln -sfn "$APP_DIR/pto-task-auto-update.service" /etc/systemd/system/pto-task-auto-update.service
         ln -sfn "$APP_DIR/pto-task-auto-update.timer" /etc/systemd/system/pto-task-auto-update.timer

@@ -30,6 +30,21 @@ grep -Fqx 'SCHEDULER_MODULE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/backfil
 [[ -x "$INSTALL_ROOT/app/pto-task-stats" && -x "$INSTALL_ROOT/app/pto-task-usage-sampler" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task.service" && -f "$INSTALL_ROOT/app/pto-task-clean.cron" ]]
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/task-daemon" "$INSTALL_ROOT/app/pto-task.service"
+# The unit must carry no Alias=. It is installed by symlink from outside the
+# systemd search path, so `systemctl enable` would render an Alias= as a second
+# symlink to that same external path -- which systemd loads as an independent
+# unit that restart-loops against the daemon's single-instance lock. setup.sh
+# installs the taskqueue.service compatibility name as a symlink to
+# /etc/systemd/system/pto-task.service instead.
+# Spelled out rather than `! grep -q ...` because set -e is specified to ignore
+# a command whose status is inverted by `!`, which would make this silently
+# unable to fail.
+# systemd ignores whitespace around '=' but rejects a leading indent, so anchor
+# at column 0 and allow "Alias = ..." through to the failure.
+if grep -q '^Alias[[:space:]]*=' "$INSTALL_ROOT/app/pto-task.service"; then
+    echo "error: pto-task.service must not declare Alias= (see comment above)" >&2
+    exit 1
+fi
 grep -Fq "$BIN_DIR/task-submit --clean" "$INSTALL_ROOT/app/pto-task-clean.cron"
 grep -Fqx "BIN_DIR=$BIN_DIR" "$INSTALL_ROOT/app/.pto-task-install-options"
 [[ -f "$INSTALL_ROOT/app/pto-task-usage-sampler.service" && -f "$INSTALL_ROOT/app/pto-task-usage-sampler.timer" ]]
