@@ -25,8 +25,8 @@ Install program files below DIR/pto-task/app (default: /home/pypto-tools) and
 create config/taskqueue.conf when it is missing. Existing configuration and
 queue state are preserved unless a configuration option below is explicitly
 passed. The installer never starts the main daemon.
-The daily idle-only update timer is enabled by default for root installations.
-Use --disable-auto-update to opt out.
+The repository-controlled automatic update timer is enabled by default for
+root installations. Use --disable-auto-update to opt out.
 
   --tools-root DIR             Installation parent directory
   --no-init-config             Do not create a missing configuration
@@ -37,6 +37,8 @@ Use --disable-auto-update to opt out.
   --ptoas-base DIR             Root containing installed PTOAS versions
   --interactive-config        Prompt for first-install host settings
   --non-interactive           Never prompt; use options/detected defaults
+  --enable-auto-update        Enable main-repository rollout control
+  --disable-auto-update       Disable repository-controlled automatic updates
 EOF
 }
 
@@ -74,6 +76,9 @@ while [[ $# -gt 0 ]]; do
         --non-interactive) INTERACTIVE_CONFIG=false; shift ;;
         --enable-auto-update) ENABLE_AUTO_UPDATE=true; shift ;;
         --disable-auto-update) ENABLE_AUTO_UPDATE=false; shift ;;
+        # Compatibility aliases from the short-lived dual-updater interface.
+        --enable-repo-auto-update) ENABLE_AUTO_UPDATE=true; shift ;;
+        --disable-repo-auto-update) ENABLE_AUTO_UPDATE=false; shift ;;
         --bin-dir) # Test hook; production default is /usr/local/bin.
             [[ -n "${2:-}" && "${2:-}" != --* ]] || { echo "--bin-dir needs a directory" >&2; exit 2; }
             BIN_DIR="$2"; shift 2 ;;
@@ -88,12 +93,15 @@ done
 TOOL_ROOT="${TOOLS_ROOT%/}/$TOOL_NAME"
 APP_DIR="$TOOL_ROOT/app"
 SCHEDULER_APP_DIR="$APP_DIR/schedulers"
+APP_LIB_DIR="$APP_DIR/lib"
+REPO_UPDATE_MODULE_DIR="$APP_LIB_DIR/repo-auto-update"
 CONFIG_DIR="$TOOL_ROOT/config"
 STATE_DIR="$TOOL_ROOT/state"
 LOGS_DIR="$TOOL_ROOT/logs"
 TMP_DIR="$TOOL_ROOT/tmp"
+UPDATE_DIR="$TOOL_ROOT/update"
 CONFIG_FILE="$CONFIG_DIR/taskqueue.conf"
-SOURCE_UPDATE_REPOSITORY="https://github.com/pypto-tools/npu-taskqueue.git"
+REPO_UPDATE_CONFIG="$CONFIG_DIR/repo-auto-update.env"
 LEGACY_CONFIG_FILE="/etc/taskqueue.conf"
 
 # Read the simple KEY=value format used by the former /etc/taskqueue.conf
@@ -407,7 +415,9 @@ fi
 # user-created symlink here could otherwise change metadata outside the
 # installation tree.
 if [[ "$(id -u)" -eq 0 ]]; then
-    for managed_dir in "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOGS_DIR" "$TMP_DIR"; do
+    for managed_dir in "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$APP_LIB_DIR" \
+        "$REPO_UPDATE_MODULE_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOGS_DIR" "$TMP_DIR" \
+        "$UPDATE_DIR"; do
         [[ ! -L "$managed_dir" ]] || {
             echo "error: managed installation directory must not be a symlink: $managed_dir" >&2
             exit 1
@@ -417,16 +427,21 @@ fi
 
 ensure_dir 755 "$APP_DIR"
 ensure_dir 755 "$SCHEDULER_APP_DIR"
+ensure_dir 755 "$APP_LIB_DIR"
+ensure_dir 755 "$REPO_UPDATE_MODULE_DIR"
 ensure_dir 755 "$CONFIG_DIR"
 ensure_dir 755 "$LOGS_DIR"
 ensure_dir 755 "$TMP_DIR"
+ensure_dir 755 "$UPDATE_DIR"
 prepare_state_layout "$STATE_DIR"
 
 # Root system units execute files from APP_DIR, so keep the installed code
 # directories root-owned and non-writable by other users.
 if [[ "$(id -u)" -eq 0 ]]; then
-    chown root:root "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
-    chmod go-w "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR"
+    chown root:root "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$APP_LIB_DIR" \
+        "$REPO_UPDATE_MODULE_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR" "$UPDATE_DIR"
+    chmod go-w "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$APP_LIB_DIR" \
+        "$REPO_UPDATE_MODULE_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR" "$UPDATE_DIR"
 fi
 install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
 # Install the shared core first, then policies, and replace the daemon last.
@@ -440,14 +455,32 @@ for scheduler_source in "$SCRIPT_DIR"/schedulers/*.sh; do
 done
 install_app_file "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon" 755
 install_app_file "$SCRIPT_DIR/npu_lock.sh" "$APP_DIR/npu_lock.sh" 755
-install_app_file "$SCRIPT_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update" 755
+install_app_file "$SCRIPT_DIR/scripts/repo-auto-update-deploy.sh" \
+    "$APP_DIR/pto-task-repo-update-deploy" 755
+install_app_file "$SCRIPT_DIR/modules/repo_auto_update/updater.sh" \
+    "$REPO_UPDATE_MODULE_DIR/updater.sh" 755
+install_app_file "$SCRIPT_DIR/modules/repo_auto_update/manifest.py" \
+    "$REPO_UPDATE_MODULE_DIR/manifest.py" 755
+install_app_file "$SCRIPT_DIR/scripts/repo-auto-update-adapter.sh" \
+    "$APP_DIR/pto-task-repo-update-verify" 755
+install_app_file "$SCRIPT_DIR/scripts/repo-auto-update-adapter.sh" \
+    "$APP_DIR/pto-task-repo-update-apply" 755
+# Remove application artifacts from the retired branch-HEAD updater and the
+# short-lived dual-channel unit names. These are managed files, not local state.
+for retired_update_file in "$APP_DIR/pto-task-auto-update" \
+    "$APP_DIR/pto-task-repo-auto-update.service" \
+    "$APP_DIR/pto-task-repo-auto-update.timer" \
+    "$APP_DIR/.pto-task-update-repository"; do
+    if [[ -d "$retired_update_file" && ! -L "$retired_update_file" ]]; then
+        echo "error: retired updater artifact is unexpectedly a directory: $retired_update_file" >&2
+        exit 1
+    fi
+    rm -f -- "$retired_update_file"
+done
 install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.sh" "$APP_DIR/pto-task-usage-sampler" 755
 install_app_file "$SCRIPT_DIR/pto-task-stats.sh" "$APP_DIR/pto-task-stats" 755
 rendered_service="$(sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task.service")"
 write_app_file "$APP_DIR/pto-task.service" 644 "$rendered_service"$'\n'
-rendered_update_service="$(sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task-auto-update.service")"
-write_app_file "$APP_DIR/pto-task-auto-update.service" 644 "$rendered_update_service"$'\n'
-install_app_file "$SCRIPT_DIR/pto-task-auto-update.timer" "$APP_DIR/pto-task-auto-update.timer" 644
 rendered_usage_service="$(sed "s|/home/pypto-tools/pto-task/app|$APP_DIR|g" "$SCRIPT_DIR/pto-task-usage-sampler.service")"
 write_app_file "$APP_DIR/pto-task-usage-sampler.service" 644 "$rendered_usage_service"$'\n'
 install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.timer" "$APP_DIR/pto-task-usage-sampler.timer" 644
@@ -458,10 +491,19 @@ write_app_file "$APP_DIR/pto-task-clean.cron" 644 "$rendered_clean_cron"$'\n'
 # Git safe.directory configuration.
 SOURCE_REVISION="$(git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)"
 SOURCE_REVISION="${SOURCE_REVISION:-unknown}"
-write_app_file "$APP_DIR/.pto-task-update-repository" 600 \
-    "$SOURCE_UPDATE_REPOSITORY"$'\n'
-printf -v install_options 'BIN_DIR=%q\nSBIN_DIR=%q\n' "$BIN_DIR" "$SBIN_DIR"
+printf -v install_options \
+    'BIN_DIR=%q\nSBIN_DIR=%q\nINSTALL_ENABLE_AUTO_UPDATE=%q\n' \
+    "$BIN_DIR" "$SBIN_DIR" "$ENABLE_AUTO_UPDATE"
 write_app_file "$APP_DIR/.pto-task-install-options" 600 "$install_options"
+
+if [[ ! -e "$REPO_UPDATE_CONFIG" ]]; then
+    rendered_repo_update_config="$(sed \
+        -e "s|@TOOL_ROOT@|$TOOL_ROOT|g" \
+        -e "s|@TMP_DIR@|$TMP_DIR|g" \
+        -e "s|@APP_DIR@|$APP_DIR|g" \
+        "$SCRIPT_DIR/config/repo-auto-update.env.in")"
+    write_app_file "$REPO_UPDATE_CONFIG" 644 "$rendered_repo_update_config"$'\n'
+fi
 
 if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
     initial_state_dir="$STATE_DIR"
@@ -490,11 +532,7 @@ if [[ "$INIT_CONFIG" == true && ! -e "$CONFIG_FILE" ]]; then
         printf '# Local taskqueue configuration. Preserved by setup.sh updates.\n'
         printf 'STATE_DIR=%q # 队列持久状态目录\n' "$initial_state_dir"
         printf 'LOGS_DIR=%q # 任务与 daemon 日志目录\n' "$initial_logs_dir"
-        sed -n '/^MAX_CONCURRENT=/,$p' "$SCRIPT_DIR/config/default.conf" |
-            sed '/^AUTO_UPDATE_REPOSITORY=/d'
-        if [[ -n "$SOURCE_UPDATE_REPOSITORY" ]]; then
-            printf 'AUTO_UPDATE_REPOSITORY=%q # 自动更新远端（官方仓库）\n' "$SOURCE_UPDATE_REPOSITORY"
-        fi
+        sed -n '/^MAX_CONCURRENT=/,$p' "$SCRIPT_DIR/config/default.conf"
     } > "$CONFIG_FILE"
     # Clients source this non-secret queue configuration before submitting a
     # task, so every local user needs read access.  Credentials must never be
@@ -515,6 +553,15 @@ if [[ "$(id -u)" -eq 0 && -e "$CONFIG_FILE" ]]; then
     chown root:root "$CONFIG_DIR" "$CONFIG_FILE"
     chmod go-w "$CONFIG_DIR" "$CONFIG_FILE"
 fi
+if [[ "$(id -u)" -eq 0 && -e "$REPO_UPDATE_CONFIG" ]]; then
+    [[ ! -L "$REPO_UPDATE_CONFIG" && -f "$REPO_UPDATE_CONFIG" &&
+       "$(stat -c %h "$REPO_UPDATE_CONFIG")" -eq 1 ]] || {
+        echo "error: unsafe repository-update configuration: $REPO_UPDATE_CONFIG" >&2
+        exit 1
+    }
+    chown root:root "$REPO_UPDATE_CONFIG"
+    chmod go-w "$REPO_UPDATE_CONFIG"
+fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
     [[ -z "$MAX_CONCURRENT_OVERRIDE" ]] || set_config_value MAX_CONCURRENT "$MAX_CONCURRENT_OVERRIDE"
@@ -527,16 +574,22 @@ fi
 # The unified installation tree is always created above. If an existing or
 # migrated configuration deliberately points at a legacy state/log location,
 # create and repair that active runtime layout as well.
+configured_state_dir="$STATE_DIR"
+configured_logs_dir="$LOGS_DIR"
+configured_tmp_dir="$TMP_DIR"
 if [[ -f "$CONFIG_FILE" ]]; then
     mapfile -t configured_paths < <(bash -c '
         source "$1"
         active_state="${STATE_DIR:-${BASE_DIR:-$2}}"
         active_logs="${LOGS_DIR:-${active_state%/state}/logs}"
-        printf "%s\n%s\n%s\n" "$active_state" "$active_logs" "${AVAILABLE_DEVICES:-}"
-    ' _ "$CONFIG_FILE" "$STATE_DIR")
+        active_tmp="${TMP_DIR:-$3}"
+        printf "%s\n%s\n%s\n%s\n" "$active_state" "$active_logs" \
+            "$active_tmp" "${AVAILABLE_DEVICES:-}"
+    ' _ "$CONFIG_FILE" "$STATE_DIR" "$TMP_DIR")
     configured_state_dir="${configured_paths[0]:-$STATE_DIR}"
     configured_logs_dir="${configured_paths[1]:-$LOGS_DIR}"
-    configured_devices="${configured_paths[2]:-}"
+    configured_tmp_dir="${configured_paths[2]:-$TMP_DIR}"
+    configured_devices="${configured_paths[3]:-}"
     prepare_state_layout "$configured_state_dir"
     [[ "$configured_logs_dir" == /* && "$configured_logs_dir" != / ]] || {
         echo "error: LOGS_DIR must be an absolute directory other than /" >&2
@@ -547,12 +600,39 @@ if [[ -f "$CONFIG_FILE" ]]; then
         exit 1
     }
     ensure_dir 755 "$configured_logs_dir"
+    [[ "$configured_tmp_dir" == /* && "$configured_tmp_dir" != / ]] || {
+        echo "error: TMP_DIR must be an absolute directory other than /" >&2
+        exit 1
+    }
+    [[ ! -L "$configured_tmp_dir" ]] || {
+        echo "error: managed temporary directory must not be a symlink: $configured_tmp_dir" >&2
+        exit 1
+    }
+    ensure_dir 755 "$configured_tmp_dir"
     if [[ "$(id -u)" -eq 0 ]]; then
-        chown root:root "$configured_logs_dir"
-        chmod go-w "$configured_logs_dir"
+        chown root:root "$configured_logs_dir" "$configured_tmp_dir"
+        chmod go-w "$configured_logs_dir" "$configured_tmp_dir"
     fi
     precreate_device_locks "$configured_state_dir" "$configured_devices"
 fi
+
+# Render the updater after resolving all administrator-selected runtime paths;
+# ProtectSystem=strict must still permit the idle lock, log, and scratch paths.
+rendered_update_service="$(sed \
+    -e 's|@NAME@|pto-task|g' \
+    -e "s|@UPDATER@|$REPO_UPDATE_MODULE_DIR/updater.sh|g" \
+    -e "s|@CONFIG@|$REPO_UPDATE_CONFIG|g" \
+    -e "s|@READ_WRITE_PATHS@|$TOOL_ROOT $configured_state_dir $configured_logs_dir $configured_tmp_dir $BIN_DIR $SBIN_DIR /etc/systemd/system /run/lock|g" \
+    -e 's|TimeoutStartSec=20min|TimeoutStartSec=infinity|' \
+    "$SCRIPT_DIR/modules/repo_auto_update/repo-auto-update.service.in")"
+write_app_file "$APP_DIR/pto-task-auto-update.service" 644 \
+    "$rendered_update_service"$'\n'
+rendered_update_timer="$(sed \
+    -e 's|@NAME@|pto-task|g' \
+    -e 's|@SERVICE_NAME@|pto-task-auto-update.service|g' \
+    "$SCRIPT_DIR/modules/repo_auto_update/repo-auto-update.timer.in")"
+write_app_file "$APP_DIR/pto-task-auto-update.timer" 644 \
+    "$rendered_update_timer"$'\n'
 
 ensure_dir 755 "$BIN_DIR"
 ln -sfn "$APP_DIR/task-submit" "$BIN_DIR/task-submit"
@@ -609,6 +689,10 @@ if [[ -f "$CONFIG_FILE" && "$(id -u)" -eq 0 ]]; then
         systemctl disable --now pto-task-auto-update.timer >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/pto-task-auto-update.service /etc/systemd/system/pto-task-auto-update.timer
     fi
+    # Retire unit names from the short-lived dual-updater implementation.
+    systemctl disable --now pto-task-repo-auto-update.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/pto-task-repo-auto-update.service \
+        /etc/systemd/system/pto-task-repo-auto-update.timer
     case "$usage_sampling_enabled" in
         1|true|TRUE|yes|YES|on|ON)
             ln -sfn "$APP_DIR/pto-task-usage-sampler.service" /etc/systemd/system/pto-task-usage-sampler.service
@@ -646,7 +730,7 @@ if [[ -f "$CONFIG_FILE" && "$(id -u)" -eq 0 ]]; then
         *) printf 'Usage sampling timer not enabled (USAGE_SAMPLING_ENABLED is false).\n' ;;
     esac
 elif [[ "$ENABLE_AUTO_UPDATE" == true ]]; then
-    printf 'Automatic update timer not enabled (requires root and initialized config).\n'
+    printf 'Update timer not enabled (requires root and initialized config).\n'
 fi
 
 # setup.sh deliberately does not restart the daemon. Leave a persistent marker

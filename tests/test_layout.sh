@@ -53,17 +53,31 @@ if grep -q '^Alias[[:space:]]*=' "$INSTALL_ROOT/app/pto-task.service"; then
 fi
 grep -Fq "$BIN_DIR/task-submit --clean" "$INSTALL_ROOT/app/pto-task-clean.cron"
 grep -Fqx "BIN_DIR=$BIN_DIR" "$INSTALL_ROOT/app/.pto-task-install-options"
+grep -Fqx 'INSTALL_ENABLE_AUTO_UPDATE=true' "$INSTALL_ROOT/app/.pto-task-install-options"
 [[ -f "$INSTALL_ROOT/app/pto-task-usage-sampler.service" && -f "$INSTALL_ROOT/app/pto-task-usage-sampler.timer" ]]
-[[ -x "$INSTALL_ROOT/app/pto-task-auto-update" ]]
+[[ -x "$INSTALL_ROOT/app/pto-task-repo-update-deploy" ]]
+[[ -x "$INSTALL_ROOT/app/lib/repo-auto-update/updater.sh" ]]
+[[ -x "$INSTALL_ROOT/app/lib/repo-auto-update/manifest.py" ]]
+[[ -x "$INSTALL_ROOT/app/pto-task-repo-update-verify" ]]
+[[ -x "$INSTALL_ROOT/app/pto-task-repo-update-apply" ]]
+[[ -f "$INSTALL_ROOT/config/repo-auto-update.env" ]]
+grep -Fqx 'REPO_AUTO_UPDATE_MANIFEST=update/rollout.json' \
+    "$INSTALL_ROOT/config/repo-auto-update.env"
+grep -Fqx 'REPO_AUTO_UPDATE_TEST_USER=daemon' \
+    "$INSTALL_ROOT/config/repo-auto-update.env"
 [[ -f "$INSTALL_ROOT/app/.pto-task-restart-required" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task-auto-update.service" && -f "$INSTALL_ROOT/app/pto-task-auto-update.timer" ]]
 [[ "$(<"$INSTALL_ROOT/app/.pto-task-release")" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]
 [[ "$("$BIN_DIR/task-submit" --version)" == "pto-task revision $(git -C "$REPO_DIR" rev-parse HEAD)" ]]
-grep -Fqx "ExecStart=$INSTALL_ROOT/app/pto-task-auto-update" "$INSTALL_ROOT/app/pto-task-auto-update.service"
-grep -Fqx 'OnCalendar=*-*-* 03:17:00 Asia/Shanghai' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
+grep -Fqx "ExecStart=$INSTALL_ROOT/app/lib/repo-auto-update/updater.sh $INSTALL_ROOT/config/repo-auto-update.env" \
+    "$INSTALL_ROOT/app/pto-task-auto-update.service"
+grep -Fqx 'TimeoutStartSec=infinity' "$INSTALL_ROOT/app/pto-task-auto-update.service"
+grep -Fqx 'OnCalendar=*-*-* 03:37:00 Asia/Shanghai' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
+grep -Fqx 'RandomizedDelaySec=20min' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
 grep -Fqx 'AccuracySec=1min' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
 grep -Fqx 'Persistent=false' "$INSTALL_ROOT/app/pto-task-auto-update.timer"
-[[ -d "$INSTALL_ROOT/config" && -d "$INSTALL_ROOT/state" && -d "$INSTALL_ROOT/logs" && -d "$INSTALL_ROOT/tmp" ]]
+[[ -d "$INSTALL_ROOT/config" && -d "$INSTALL_ROOT/state" && -d "$INSTALL_ROOT/logs" &&
+   -d "$INSTALL_ROOT/tmp" && -d "$INSTALL_ROOT/update" ]]
 for shared_dir in pending locks kill fifo; do
     [[ -d "$INSTALL_ROOT/state/$shared_dir" ]]
     [[ "$(stat -c %a "$INSTALL_ROOT/state/$shared_dir")" == 1777 ]]
@@ -77,16 +91,18 @@ grep -q '^SCHEDULER_MODE="backfill"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueu
 grep -q '^POOL_AWARE_RESERVATION_MIN_DEVICES=2[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^PTOAS_BASE="/usr/local/ptoas"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^MAX_CONCURRENT_8_CARD_TASKS=0[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
-grep -q '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf"
-[[ "$(grep -c '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf")" -eq 1 ]]
-grep -q '^AUTO_UPDATE_BRANCH="main"' "$INSTALL_ROOT/config/taskqueue.conf"
+if grep -Eq '^AUTO_UPDATE_(REPOSITORY|BRANCH)=' "$INSTALL_ROOT/config/taskqueue.conf"; then
+    echo 'error: taskqueue config still contains retired branch-HEAD updater settings' >&2
+    exit 1
+fi
 grep -q '^AUTO_UPDATE_IDLE_WAIT_SECONDS=7200' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 666 ]]
 if [[ "$(id -u)" -eq 0 ]]; then
     [[ "$(stat -c %u "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 0 ]]
     for root_dir in "$INSTALL_ROOT" "$INSTALL_ROOT/app" "$INSTALL_ROOT/app/schedulers" "$INSTALL_ROOT/config" \
-        "$INSTALL_ROOT/state" "$INSTALL_ROOT/logs" "$INSTALL_ROOT/tmp" \
+        "$INSTALL_ROOT/app/lib" "$INSTALL_ROOT/app/lib/repo-auto-update" \
+        "$INSTALL_ROOT/state" "$INSTALL_ROOT/logs" "$INSTALL_ROOT/tmp" "$INSTALL_ROOT/update" \
         "$INSTALL_ROOT/state/pending" "$INSTALL_ROOT/state/locks"; do
         [[ "$(stat -c '%U:%G' "$root_dir")" == root:root ]]
     done
@@ -98,7 +114,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
     leaf_directory_target="$TEST_ROOT/managed-leaf-directory-target"
     printf 'unchanged\n' > "$leaf_target"
     mkdir -p "$leaf_directory_target"
-    for managed_leaf in pto-task.service .pto-task-update-repository \
+    for managed_leaf in pto-task.service \
         .pto-task-install-options .pto-task-restart-required; do
         rm -f "$INSTALL_ROOT/app/$managed_leaf"
         ln -s "$leaf_target" "$INSTALL_ROOT/app/$managed_leaf"
@@ -109,7 +125,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
         --sbin-dir "$SBIN_DIR" >/dev/null
     [[ "$(<"$leaf_target")" == unchanged ]]
     [[ -z "$(find "$leaf_directory_target" -mindepth 1 -print -quit)" ]]
-    for managed_leaf in pto-task.service .pto-task-update-repository \
+    for managed_leaf in pto-task.service \
         .pto-task-install-options .pto-task-restart-required .pto-task-release; do
         [[ -f "$INSTALL_ROOT/app/$managed_leaf" && ! -L "$INSTALL_ROOT/app/$managed_leaf" ]]
         [[ "$(stat -c '%U:%G' "$INSTALL_ROOT/app/$managed_leaf")" == root:root ]]
@@ -126,8 +142,6 @@ if [[ "$(id -u)" -eq 0 ]]; then
     fi
     [[ -z "$(find "$managed_symlink_target" -mindepth 1 -print -quit)" ]]
 fi
-grep -Fqx 'https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/app/.pto-task-update-repository"
-grep -Fq 'AUTO_UPDATE_REPOSITORY=https://github.com/pypto-tools/npu-taskqueue.git' "$INSTALL_ROOT/config/taskqueue.conf"
 "$BIN_DIR/task-submit" 'true' >/dev/null
 "$BIN_DIR/pto-task" 'true' >/dev/null
 compgen -G "$INSTALL_ROOT/state/pending/task_*" >/dev/null
@@ -380,5 +394,8 @@ bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
 bash "$REPO_DIR/tests/test_eight_card_limit.sh"
 bash "$REPO_DIR/tests/test_scheduler_core.sh"
 bash "$REPO_DIR/tests/test_pool_aware_reservation.sh"
+bash "$REPO_DIR/tests/test_repo_auto_update_adapter.sh"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_DIR" \
+    python3 -m unittest discover -s "$REPO_DIR/tests" -p 'test_update_manifest.py'
 
 echo 'layout tests passed'

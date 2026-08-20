@@ -134,18 +134,32 @@ installation. `npu_lock.sh` and the daemon remain private app components.
 
 ## Automatic updates
 
-The automatic-update timer is enabled by default for root installations with
-initialized config. It follows the access-controlled branch configured by
-`AUTO_UPDATE_BRANCH` (default `main`), so repository write and merge access must
-remain restricted. Use `sudo bash setup.sh --disable-auto-update` to opt out.
-The official `pypto-tools/npu-taskqueue` repository is the default;
-administrators may override `AUTO_UPDATE_REPOSITORY` in installed config. The
-updater retries twice at five-minute intervals after a fetch failure, then waits
-for an idle queue, updates only `app/`, and safely restarts an active daemon.
-Failed activation remains marked for retry; an intentionally inactive daemon is
-not started. The timer runs at 03:17 Asia/Shanghai using the host's synchronized
-clock, does not replay missed runs during daytime, and caps idle waiting at two
-hours. Keep Git/SSH credentials outside configuration and logs.
+The repository-controlled timer is the only automatic-update channel and is
+enabled by default for root installations with initialized config. It never
+treats branch HEAD as an implicit deployment target. Use
+`sudo bash setup.sh --disable-auto-update` to opt out and repeat that flag on
+later deployments. The main branch's `update/rollout.json` selects a full commit
+ID and increasing sequence; rollback also requires `allow_rollback:true`. The
+default enabled manifest has an empty target and sequence zero, so polling stays
+healthy without updating until the main repository selects a commit.
+
+The controlled timer checks at 03:37 Asia/Shanghai with up to twenty minutes of
+random delay. It verifies the exact candidate as the non-root user configured
+in `config/repo-auto-update.env`, then reuses the existing update reservation,
+idle wait, installer verification, and persistent activation marker. It deploys
+the exact revision and safely restarts an active daemon after the queue becomes
+idle. Failed activation remains retryable; an intentionally inactive daemon is
+not started. Preserve `config/`, queue state, logs, and rollout markers under
+`<root>/update/`.
+If root has no direct repository egress, configure the optional fetch user and
+non-credentialed proxy URL in the same root-owned configuration file.
+
+The generic polling and manifest implementation is
+`modules/repo_auto_update/`; pto-task-specific verification and application
+belong in `scripts/repo-auto-update-adapter.sh`. Every enabled rollout must
+target a commit already on the configured branch and use a sequence greater
+than the previous rollout. Keep the target empty until its code and tests have
+already landed.
 
 ## Source mode
 

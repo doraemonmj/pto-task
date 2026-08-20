@@ -83,20 +83,34 @@ POOL_AWARE_RESERVATION_MIN_DEVICES=2
 旧版 `/etc/taskqueue.conf` 中安全的 `BASE_DIR` 和 `MAX_CONCURRENT` 会自动迁移，
 `taskqueue.service` 也保留为 `pto-task.service` 的兼容名称。
 
-自动更新会先阻止新任务提交，等待 pending 和 running 都为空后再安装并安全重启
-正在运行的 daemon。重启失败会保留待激活标记，在下次定时更新时继续重试；原本
-处于停止状态的 daemon 不会被自动启动。安装 revision 只在 systemd service/timer
-链接完成且 timer 已启用、运行后才写入 `.pto-task-release`；失败时保留旧 revision
-供下次重试，完整安装输出和退出码写入 `logs/auto-update.log`。管理员和普通用户可用
-`task-submit --version` 查看当前安装 revision。
+自动更新只保留主仓控制模式，不再直接跟随分支 HEAD。服务器定时读取主仓
+`update/rollout.json` 指定的精确 commit，验证通过后先阻止新任务提交，等待 pending
+和 running 都为空，再安装并安全重启正在运行的 daemon。重启失败会保留待激活标记
+供下次重试；原本处于停止状态的 daemon 不会被自动启动。完整安装输出和退出码写入
+`logs/auto-update.log`，可用 `task-submit --version` 查看当前安装 revision。
 
-定时器固定在北京时间（`Asia/Shanghai`）每天凌晨 03:17，使用服务器经 NTP
-同步后的系统时钟，不受服务器本地时区影响。若服务器夜间关机，白天启动时不会
-补跑错过的更新。等待队列空闲的单次上限为 2 小时，每 5 分钟检查一次；新版的
-2 小时硬上限也会限制仍保存旧版 6 小时配置的服务器。
+定时器固定在北京时间（`Asia/Shanghai`）每天凌晨 03:37，并加入最多 20 分钟随机
+延迟。等待队列空闲的单次上限为 2 小时，每 5 分钟检查一次；新版的 2 小时硬上限
+也会限制仍保存旧版 6 小时配置的服务器。
 
 如需关闭自动更新，部署时使用 `sudo bash deploy.sh --disable-auto-update`；后续
 手动升级也继续携带该选项，因为普通部署默认会重新安装并验证自动更新 timer。
+
+默认清单采用 `enabled: true`、空 `target`、`sequence: 0` 的待命状态：本服务器
+保留并运行自动更新 timer，但主仓未指定 commit 时不会更新。主仓把 `target` 指向
+已经合入目标分支的完整 commit ID 并递增 `sequence` 后，服务器才会验证、部署并
+激活该版本。序号倒退或被不同 commit 重用会被拒绝；回退到旧版本还必须显式设置
+`allow_rollback: true`。
+
+候选版本先由 `config/repo-auto-update.env` 配置的非 root 用户（默认 `daemon`）运行
+测试，再执行空闲队列部署。集中发布状态保存在 `<tools-root>/pto-task/update/`，本机
+任务配置、队列、日志不会被覆盖。
+仓库默认由 root 拉取；若 root 无法直接出网，可在同一配置中设置
+`REPO_AUTO_UPDATE_FETCH_USER` 和 `REPO_AUTO_UPDATE_FETCH_ALL_PROXY`。
+
+推荐先合入并测试代码提交，再单独提交一次 rollout 清单变更。需要停止推广时将
+`enabled` 改回 `false`。主仓代码最终会以 root 安装，必须严格保护仓库写入、合入
+和管理员权限。
 
 如果某台共享开发服务器需要限制 8 卡用例并发，可仅在该机的
 `/home/pypto-tools/pto-task/config/taskqueue.conf` 中设置：
@@ -108,10 +122,6 @@ MAX_CONCURRENT_8_CARD_TASKS=1
 默认值为 `0`（关闭），其他服务器自动更新代码后不会自动开启。开启后，
 已有一个 8 卡用例运行时，后续 8 卡用例保持 pending；daemon 会跳过它
 继续调度后面的小卡任务。
-
-从旧版（自动更新从不重启 daemon）迁移时，第一次定时运行会安装新版并留下待激活
-标记，下一次定时运行完成激活；如果希望发布后立即生效，在已有服务器上手动执行
-一次 `sudo bash deploy.sh` 即可。
 
 ## 提交
 

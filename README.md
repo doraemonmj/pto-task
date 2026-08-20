@@ -45,6 +45,7 @@ The default installation is:
 ├── app/       # deployed programs and root-managed scheduler modules
 ├── config/    # local taskqueue.conf; never overwritten by an update
 ├── state/     # pending, running, done, locks, FIFO, usage and daemon state
+├── update/    # repository-controlled rollout sequence and staging markers
 ├── logs/      # task and daemon logs
 └── tmp/       # temporary files
 ```
@@ -228,54 +229,47 @@ Git and deployed installations.
 
 ## Automatic updates
 
-The automatic-update timer is enabled by default for a root installation with
-initialized configuration. New installations default to the official
-`pypto-tools/npu-taskqueue` repository regardless of which development checkout
-runs the installer. Administrators may override `AUTO_UPDATE_REPOSITORY` in the
-installed configuration; the updater follows that repository's configured,
-access-controlled branch:
-
-```bash
-AUTO_UPDATE_REPOSITORY="https://github.com/pypto-tools/npu-taskqueue.git"
-AUTO_UPDATE_BRANCH="main"
-```
-
-Restrict repository write and merge access because the updater executes the
-selected branch's `setup.sh` as root. To opt out of installing the timer:
+There is one automatic-update channel: the main repository explicitly selects
+an exact commit through `update/rollout.json`. Servers never treat branch HEAD
+as an implicit deployment target. The polling timer is enabled by default for a
+root installation with initialized configuration. To opt out:
 
 ```bash
 sudo bash deploy.sh --disable-auto-update
 ```
 
-Pass `--disable-auto-update` on later manual deployments too; an ordinary
-deployment enables and verifies the timer by default.
+Pass `--disable-auto-update` on later manual deployments too because the default
+is enabled. The committed manifest defaults to the armed-but-idle state:
+`enabled: true`, empty `target`, and `sequence: 0`. Servers keep polling but do
+nothing until the main repository supplies a full commit ID and a positive,
+increasing sequence. Reused or decreasing sequences are rejected; moving to an
+older installed commit additionally requires `allow_rollback: true`.
 
-The timer starts daily at 03:17 `Asia/Shanghai` (Beijing time), independent of
-the server's local timezone. It uses the host's NTP-synchronized system clock
-and does not replay a missed nighttime run after a daytime boot. A failed
-repository fetch is retried twice at five-minute intervals. After a successful
-fetch into `tmp/`, the updater takes an exclusive update reservation and waits
-up to two hours for both `state/pending` and `state/running` to be empty,
-checking every five minutes. `AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200` also caps
-older installed configurations that still contain the former six-hour value.
-It updates only `app/`, preserves `config/` and `state/`,
-then safely restarts an active daemon before allowing new submissions. A
-persistent activation marker is cleared only after restart succeeds, so a
-failed restart is retried by the next timer run. An intentionally inactive
-daemon is not started automatically. The result is recorded in
-`logs/auto-update.log`, including installer output and exit status on failure.
-The installed Git revision is recorded in `app/.pto-task-release` only after
-the requested systemd integration succeeds and is visible through
-`task-submit --version`. Installation verifies that the update service and
-timer links both exist and that the timer is enabled and active; otherwise the
-old revision remains recorded so a later run can retry.
+The rollout timer checks daily at 03:37 `Asia/Shanghai` with up to 20 minutes
+of randomized delay. It fetches the exact target, verifies it as the
+unprivileged account configured in
+`config/repo-auto-update.env` (default `daemon`), takes the update reservation,
+and waits up to two hours for the pending and running queues to become empty.
+It then installs the selected revision and safely restarts an active daemon
+before accepting new submissions. Failed activation remains retryable; a daemon
+that was intentionally inactive is not started. Local configuration, queue
+state, logs, and rollout state are preserved. Repository fetches use root by
+default; hosts that require a local egress proxy can set
+`REPO_AUTO_UPDATE_FETCH_USER` and
+`REPO_AUTO_UPDATE_FETCH_ALL_PROXY` in that same configuration file.
 
-When upgrading from a release whose updater never restarted the daemon, the
-first timer run installs this release and leaves the activation marker; the
-next timer run activates it. Run `sudo bash deploy.sh` once on existing hosts
-after publishing when immediate activation is preferred.
-For private repositories, configure host Git/SSH credentials outside this
-configuration file; never put tokens or passwords in it.
+Recommended release order:
+
+1. Merge and test the application change on `main`; record its full commit ID.
+2. Commit only the rollout manifest with that target and a higher sequence.
+3. Observe deployed revisions under `<tools-root>/pto-task/update/`; stop the
+   rollout by clearing `target` or setting `enabled` to `false` if needed.
+
+Repository polling, manifest validation, ancestry checks, rollback control,
+locking, and sequence markers live in the reusable
+`modules/repo_auto_update/` package. `scripts/repo-auto-update-adapter.sh`
+contains the pto-task verification bridge; `repo-auto-update-deploy.sh` owns
+idle-only installation and activation.
 
 For a concise Chinese usage guide, see [GUIDE_ZH.md](GUIDE_ZH.md). AI agents
 can use [skills/pto-task-operations/SKILL.md](skills/pto-task-operations/SKILL.md).
