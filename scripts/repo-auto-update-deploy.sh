@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Daily updater. Installation and daemon activation happen only while the queue
-# is empty and new submissions are blocked by the update reservation lock.
+# Deploy an exact repository-controlled target after verification. Installation
+# and daemon activation happen only while the queue is empty and new submissions
+# are blocked by the update reservation lock.
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -11,6 +12,8 @@ LOGS_DIR="$TOOL_ROOT/logs"
 TMP_DIR="$TOOL_ROOT/tmp"
 RESTART_MARKER="$APP_DIR/.pto-task-restart-required"
 ACTIVATION_RETRY_MARKER="$APP_DIR/.pto-task-activation-retry"
+CONTROLLED_CHECKOUT="${PTO_TASK_UPDATE_CHECKOUT:-}"
+CONTROLLED_TARGET="${PTO_TASK_UPDATE_TARGET:-}"
 
 root_control_path_is_safe() {
     local path="$1" expected_type="$2" mode
@@ -64,21 +67,10 @@ source "$CONFIG_FILE"
 STATE_DIR="${STATE_DIR:-$TOOL_ROOT/state}"
 LOGS_DIR="${LOGS_DIR:-$TOOL_ROOT/logs}"
 TMP_DIR="${TMP_DIR:-$TOOL_ROOT/tmp}"
-UPDATE_REPOSITORY="${AUTO_UPDATE_REPOSITORY:-}"
-if [[ -z "$UPDATE_REPOSITORY" && -f "$APP_DIR/.pto-task-update-repository" ]]; then
-    if ! root_control_path_is_safe "$APP_DIR/.pto-task-update-repository" file; then
-        echo "error: unsafe automatic-update repository control file" >&2
-        exit 1
-    fi
-    UPDATE_REPOSITORY="$(<"$APP_DIR/.pto-task-update-repository")"
-fi
-UPDATE_BRANCH="${AUTO_UPDATE_BRANCH:-main}"
 IDLE_WAIT_SECONDS="${AUTO_UPDATE_IDLE_WAIT_SECONDS:-7200}"
 IDLE_WAIT_MAX_SECONDS="${AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS:-7200}"
 IDLE_RETRY_SECONDS="${AUTO_UPDATE_IDLE_RETRY_SECONDS:-300}"
 IDLE_WAIT_HARD_MAX_SECONDS=7200
-FETCH_ATTEMPTS=3
-FETCH_RETRY_SECONDS=300
 
 mkdir -p "$LOGS_DIR" "$TMP_DIR"
 if ! root_control_path_is_safe "$STATE_DIR" directory ||
@@ -124,35 +116,27 @@ for control_file in "$APP_DIR/.pto-task-release" "$RESTART_MARKER" "$ACTIVATION_
     fi
 done
 
-if [[ -z "$UPDATE_REPOSITORY" ]]; then
-    log 'automatic update disabled: AUTO_UPDATE_REPOSITORY is empty'
-    exit 0
-fi
 if ! command -v git >/dev/null 2>&1; then
     log 'skip update: git is unavailable'
     exit 1
 fi
 
-checkout="$(mktemp -d "$TMP_DIR/auto-update.XXXXXX")"
-trap 'rm -rf "$checkout"' EXIT
-checkout_repo=""
-for ((attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++)); do
-    candidate="$checkout/repo-$attempt"
-    if git clone --depth 1 --branch "$UPDATE_BRANCH" "$UPDATE_REPOSITORY" "$candidate" >/dev/null 2>&1; then
-        checkout_repo="$candidate"
-        break
-    fi
-    if (( attempt < FETCH_ATTEMPTS )); then
-        log "update check attempt ${attempt}/${FETCH_ATTEMPTS} failed; retrying in ${FETCH_RETRY_SECONDS}s"
-        sleep "$FETCH_RETRY_SECONDS"
-    fi
-done
-if [[ -z "$checkout_repo" ]]; then
-    log "update check failed after ${FETCH_ATTEMPTS} attempts: unable to fetch repository"
+if [[ -z "$CONTROLLED_CHECKOUT" || -z "$CONTROLLED_TARGET" ||
+      ! "$CONTROLLED_TARGET" =~ ^[0-9a-f]{40,64}$ ]]; then
+    log 'controlled update aborted: checkout and full target are required'
+    exit 1
+fi
+if ! root_control_path_is_safe "$CONTROLLED_CHECKOUT" directory; then
+    log 'controlled update aborted: candidate checkout is unsafe'
+    exit 1
+fi
+checkout_repo="$CONTROLLED_CHECKOUT"
+remote_revision="$(git -C "$checkout_repo" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$remote_revision" != "$CONTROLLED_TARGET" ]]; then
+    log "controlled update aborted: checkout revision does not match target $(short_revision "$CONTROLLED_TARGET")"
     exit 1
 fi
 
-remote_revision="$(git -C "$checkout_repo" rev-parse HEAD)"
 installed_revision="$(cat "$APP_DIR/.pto-task-release" 2>/dev/null || true)"
 update_required=false
 if [[ "$remote_revision" != "$installed_revision" ]]; then
@@ -164,8 +148,8 @@ if [[ "$update_required" == false && ! -e "$RESTART_MARKER" ]]; then
     exit 0
 fi
 
-# Fetch first, then wait for an idle queue. Ignore .env sidecars; any actual
-# pending/running task defers the app update without affecting current work.
+# The module has already fetched and verified this exact candidate. Wait for an
+# idle queue; ignore .env sidecars, while any real task defers the deployment.
 if [[ ! "$IDLE_WAIT_SECONDS" =~ ^[0-9]+$ ||
       ! "$IDLE_WAIT_MAX_SECONDS" =~ ^[0-9]+$ ||
       ! "$IDLE_RETRY_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
@@ -212,15 +196,31 @@ done
 
 BIN_DIR=/usr/local/bin
 SBIN_DIR=/usr/local/sbin
+INSTALL_ENABLE_AUTO_UPDATE=true
 if [[ -f "$APP_DIR/.pto-task-install-options" ]]; then
     source "$APP_DIR/.pto-task-install-options"
 fi
+# Preserve automatic polling when upgrading a host that briefly used the
+# two-channel option file (`auto=false`, `repo-auto=true`).
+if [[ "${INSTALL_ENABLE_REPO_AUTO_UPDATE:-false}" == true ]]; then
+    INSTALL_ENABLE_AUTO_UPDATE=true
+fi
+setup_update_args=(
+    --non-interactive
+    --tools-root "$(dirname "$TOOL_ROOT")"
+    --bin-dir "$BIN_DIR"
+    --sbin-dir "$SBIN_DIR"
+)
+if [[ "$INSTALL_ENABLE_AUTO_UPDATE" == true ]]; then
+    setup_update_args+=(--enable-auto-update)
+else
+    setup_update_args+=(--disable-auto-update)
+fi
 if [[ "$update_required" == true ]]; then
-    setup_log="$checkout/setup.log"
+    setup_log="$(mktemp "$TMP_DIR/controlled-update-setup.XXXXXX")"
+    trap 'rm -f "$setup_log"' EXIT
     setup_rc=0
-    if bash "$checkout_repo/setup.sh" --non-interactive \
-        --tools-root "$(dirname "$TOOL_ROOT")" \
-        --bin-dir "$BIN_DIR" --sbin-dir "$SBIN_DIR" >"$setup_log" 2>&1; then
+    if bash "$checkout_repo/setup.sh" "${setup_update_args[@]}" >"$setup_log" 2>&1; then
         setup_rc=0
     else
         setup_rc=$?

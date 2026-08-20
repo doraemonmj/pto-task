@@ -45,6 +45,18 @@ not enable this policy elsewhere.
 `USAGE_SAMPLING_ENABLED` defaults to `false`; set it to `true` and rerun
 `setup.sh` to install and enable the independent usage-sampling timer.
 
+Repository-controlled rollout settings are kept separately in
+`config/repo-auto-update.env`, which is also preserved across updates. This is
+the only automatic-update channel and its timer is enabled by default. The
+remote gate is `update/rollout.json`; its default enabled-but-empty target keeps
+servers polling without updating. A deployment target must be a full commit on
+the configured branch with a monotonically increasing sequence. Candidate tests
+run as `REPO_AUTO_UPDATE_TEST_USER`; after the queue becomes idle, the exact
+target is installed and an active daemon is restarted automatically. Optional
+`REPO_AUTO_UPDATE_FETCH_USER` and
+`REPO_AUTO_UPDATE_FETCH_ALL_PROXY` settings support hosts where the root service
+has no direct repository egress.
+
 For a source checkout, put equivalent local configuration in the ignored
 `runtime/config/taskqueue.conf`; source execution uses `runtime/state` and
 `runtime/logs` by default.
