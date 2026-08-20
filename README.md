@@ -130,7 +130,8 @@ credentials in it. The software does not store or print credentials.
 | Key | Default | Meaning |
 |---|---:|---|
 | `MAX_CONCURRENT` | `10` | Maximum simultaneously running jobs |
-| `SCHEDULER_MODE` | `backfill` | Scheduler policy; `backfill` preserves historical behavior |
+| `SCHEDULER_MODE` | `backfill` | `backfill` for opportunistic throughput, or `pool_aware_reservation` for pool-aware multi-device reservation |
+| `POOL_AWARE_RESERVATION_MIN_DEVICES` | `2` | Minimum request size that creates a reservation in `pool_aware_reservation` |
 | `MAX_CONCURRENT_8_CARD_TASKS` | `0` | Optional per-host limit for exactly eight-card jobs; `0` disables it |
 | `MAX_TIME_HARD_CAP` | `0` | Server maximum task duration; `0` means unlimited |
 | `KILL_GRACE` | `5` | Seconds from SIGTERM to SIGKILL |
@@ -145,6 +146,17 @@ tree. Do not point them at `/data` or a user home directory.
 set it to `1` in its preserved local `config/taskqueue.conf` to keep a second
 eight-card job pending while the daemon continues scheduling later smaller
 jobs. Code-only and automatic updates do not enable the policy on other hosts.
+
+`pool_aware_reservation` retains FIFO order for multi-device reservations. When
+the oldest satisfiable request at or above
+`POOL_AWARE_RESERVATION_MIN_DEVICES` is blocked by current allocations, its
+effective `DEVICE_POOL` becomes protected until enough cards have accumulated.
+Younger jobs still run when their own effective pool contains enough free
+devices outside that protected range. Device-free jobs may continue while one
+concurrency slot is reserved. Existing running jobs are never preempted, and
+impossible `auto:N` requests do not become queue barriers. Select the mode in
+the preserved local configuration and restart the daemon while the queue is
+idle.
 
 ### Task execution identity
 

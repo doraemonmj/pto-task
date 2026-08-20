@@ -16,10 +16,18 @@ written by the installer.
 
 `SCHEDULER_MODE` selects a root-managed scheduler module. `backfill` is the
 default and preserves the historical behavior: a blocked task is skipped so
-later runnable tasks may use otherwise idle resources. Unknown modes are
-rejected instead of silently falling back to another policy. The mode is read
-when the daemon starts; change it only while the queue is idle, then restart
-the service.
+later runnable tasks may use otherwise idle resources.
+`pool_aware_reservation` prevents multi-device starvation by stopping younger
+device jobs when the oldest
+satisfiable multi-device request is waiting for cards. Its effective
+`DEVICE_POOL` is protected while released cards accumulate; younger jobs may
+still use enough free devices outside that range, including disjoint pools from
+other repositories' `task-submit.conf` files. Device-free work may continue
+while a concurrency slot is reserved. `POOL_AWARE_RESERVATION_MIN_DEVICES`
+controls the minimum reservation size and defaults to `2`. Unknown modes and
+invalid module settings are rejected instead of silently falling back. The
+mode is read when the daemon starts; change it only while the queue is idle,
+then restart the service.
 
 `MAX_CONCURRENT_8_CARD_TASKS` defaults to `0`, which preserves the historical
 scheduler behavior. Set it to `1` only in a host's local configuration when

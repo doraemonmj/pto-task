@@ -1,6 +1,6 @@
 ---
 name: pto-task-operations
-description: Operate, diagnose, install, or update the pypto NPU TaskQueue. Use when working with task-submit or pto-task submissions, its daemon, deployment layout, configuration, queue state, logs, or device allocation.
+description: Operate, diagnose, install, update, or modify scheduling for the pypto NPU TaskQueue. Use when working with task-submit or pto-task submissions, task-submit.conf device pools, SCHEDULER_MODE, multi-card starvation or reservation, the daemon, deployment layout, configuration, queue state, logs, or device allocation.
 ---
 
 # TaskQueue operations
@@ -28,6 +28,45 @@ state, logs, commands, or responses.
 with the `HwHiAiUser` NPU group. Change it to `root` only when all submitters
 are trusted; it grants root execution to every queued command and requires a
 daemon restart.
+
+## Scheduler policies
+
+Select the root-managed policy with `SCHEDULER_MODE` in
+`<root>/config/taskqueue.conf`; change it only while pending and running are
+empty, then restart the daemon.
+
+- `backfill` is the default historical policy. Skip blocked tasks and run later
+  work whenever its resources are free. It maximizes opportunistic throughput
+  but can starve a multi-card request under continuous smaller traffic.
+- `pool_aware_reservation` is the pool-aware reservation policy. Configure its
+  threshold with `POOL_AWARE_RESERVATION_MIN_DEVICES` (default `2`).
+
+Preserve these `pool_aware_reservation` invariants when diagnosing or changing
+the scheduler:
+
+1. Process pending tasks in filename/FIFO order. If an earlier request fits,
+   start it before considering later work. Thus five free cards admit `3+2`,
+   while `4+2` starts the four-card task and leaves the two-card task pending.
+2. When the oldest satisfiable request at or above the threshold cannot get
+   enough cards, protect its effective `DEVICE_POOL`. This field is already the
+   client-computed intersection of the global auto pool and repository
+   `task-submit.conf` policy; do not rediscover repository policy in the daemon.
+3. For a younger auto request, subtract the protected pool from its own
+   effective pool. Start it only when the remaining free cards satisfy the
+   entire request. Allow explicit device requests only when disjoint from the
+   protected devices.
+4. Allow device-free tasks while keeping one `MAX_CONCURRENT` slot for the
+   reserved task. Do not let the eight-card admission cap itself create a
+   reservation. Do not let an impossible `auto:N` request become a barrier.
+5. Never pre-lock or launch placeholder processes for accumulated cards. The
+   reservation is a scheduling decision recomputed from pending/running state;
+   real tasks alone acquire `npu_lock.sh`. Do not describe this policy as strict
+   FIFO, preemption, or a physical device lock.
+
+The policy module is `app/schedulers/pool_aware_reservation.sh` after install
+and `schedulers/pool_aware_reservation.sh` in a checkout. Keep task claiming,
+atomic state transitions, process launch, and in-tick resource accounting in
+daemon core through `start_pending_task()`.
 
 ## Operate safely
 

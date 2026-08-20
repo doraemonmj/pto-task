@@ -1,4 +1,4 @@
 interface:
   display_name: "PTO Task Operations"
-  short_description: "Operate the pypto NPU task queue safely"
-  default_prompt: "Use $pto-task-operations to operate or diagnose the NPU task queue."
+  short_description: "Operate and diagnose PTO Task scheduling safely"
+  default_prompt: "Use $pto-task-operations to operate, diagnose, or modify PTO Task scheduling safely."

@@ -24,9 +24,12 @@ INSTALL_ROOT="$TOOLS_ROOT/pto-task"
 [[ "$(readlink -f "$BIN_DIR/pto-task")" == "$INSTALL_ROOT/app/task-submit" ]]
 [[ -x "$INSTALL_ROOT/app/task-submit" ]]
 [[ -f "$INSTALL_ROOT/app/schedulers/backfill.sh" ]]
+[[ -f "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh" ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers")" == 755 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/backfill.sh")" == 644 ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh")" == 644 ]]
 grep -Fqx 'SCHEDULER_MODULE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/backfill.sh"
+grep -Fqx 'SCHEDULER_MODULE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh"
 [[ -x "$INSTALL_ROOT/app/pto-task-stats" && -x "$INSTALL_ROOT/app/pto-task-usage-sampler" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task.service" && -f "$INSTALL_ROOT/app/pto-task-clean.cron" ]]
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/task-daemon" "$INSTALL_ROOT/app/pto-task.service"
@@ -53,6 +56,7 @@ for private_dir in running 'done' usage; do
 done
 grep -q '^TASK_EXECUTION_MODE="HwHiAiUser"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^SCHEDULER_MODE="backfill"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
+grep -q '^POOL_AWARE_RESERVATION_MIN_DEVICES=2[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^PTOAS_BASE="/usr/local/ptoas"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^MAX_CONCURRENT_8_CARD_TASKS=0[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^AUTO_UPDATE_REPOSITORY=' "$INSTALL_ROOT/config/taskqueue.conf"
@@ -356,5 +360,6 @@ fi
 bash "$REPO_DIR/tests/test_auto_update_retry.sh"
 bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
 bash "$REPO_DIR/tests/test_eight_card_limit.sh"
+bash "$REPO_DIR/tests/test_pool_aware_reservation.sh"
 
 echo 'layout tests passed'

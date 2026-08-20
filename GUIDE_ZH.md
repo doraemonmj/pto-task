@@ -41,12 +41,28 @@ sudo bash deploy.sh --max-concurrent 8 --available-devices 0,1,2,3 \
   --ptoas-base /usr/local/ptoas --task-execution-mode HwHiAiUser
 ```
 
-调度策略由 root 管理的独立模块提供。当前默认模式是 `backfill`，与历史行为
-一致：暂时无法获得设备的任务不会阻塞后面可运行的任务。可在本机配置中显式写：
+调度策略由 root 管理的独立模块提供。默认的 `backfill` 与历史行为一致：暂时
+无法获得设备的任务不会阻塞后面可运行的任务。若要避免持续到来的少卡任务让
+多卡任务一直凑不齐卡，可启用 `pool_aware_reservation`（卡池感知预约）：最老的
+多卡任务暂时凑不齐卡时，保护它由 `task-submit.conf` 算出的有效卡池，让已运行
+任务释放的卡自然积累。
+后续任务若能从保护范围之外找到足够的空卡仍可运行；无卡任务也可运行，但会为
+多卡任务保留一个并发槽。
 
 ```bash
+# 历史吞吐优先策略
 SCHEDULER_MODE="backfill"
+
+# 或：卡池感知预约策略（修改后需重启 daemon）
+SCHEDULER_MODE="pool_aware_reservation"
+POOL_AWARE_RESERVATION_MIN_DEVICES=2
 ```
+
+`POOL_AWARE_RESERVATION_MIN_DEVICES` 指定从几卡任务开始触发预约，必须不小于
+2；例如设为 `4` 时，2 卡任务仍按普通回填处理，4 卡及以上任务可建立预约。攒卡不会
+终止已经运行的任务，因此实际等待时间仍取决于这些任务何时结束。同一 auto
+范围有 5 张空卡时，3 卡任务启动后，后面的 2 卡任务可使用剩余 2 张；若前面是
+4 卡任务，后面的 2 卡任务会因只剩 1 张而继续等待。
 
 未知模式会导致 daemon 拒绝启动，不会静默切换策略。
 调度模式在 daemon 启动时读取；切换时应先等待 pending 和 running 队列为空，
