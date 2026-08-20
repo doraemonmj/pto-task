@@ -111,11 +111,26 @@ fi
 
 usage() {
     cat <<'EOF'
-task-submit — 提交任务到 root 执行队列
+task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
+
+  禁止裸跑占卡：所有要用 NPU 的命令都必须经 task-submit 提交，由队列分配卡并在
+  任务结束后释放。不用 NPU 的命令（编译、CPU 测试等）同样可以提交，
+  但不要占卡——占着卡不用会让别人白排队。
+
+  任务以什么身份执行，由部署时的 TASK_EXECUTION_MODE 决定（见 config/taskqueue.conf）:
+    HwHiAiUser (默认)  仍以提交者自己的 UID 运行，只临时补上 HwHiAiUser 组以获得 NPU
+                       设备访问权限——不是 root，文件属主、家目录权限都还是你自己的
+    root               任务直接以 root 执行；仅在所有提交者都可信时才这么配
+  用 task-submit --no-device --run 'id' 可以看到当前这台机器实际是哪种模式。
+
+  占不占卡，看命令本身要不要真的跑在卡上:
+    --no-device        不占卡（也是默认行为）。编译、CPU 任务用这个
+    --device auto      需要在卡上跑时才分配；作业内用 $TASK_DEVICE 拿到卡号
 
 提交:
-  task-submit "command"                        提交任务，返回 task-id（不分配 NPU 卡）
-  task-submit --run "command"                  提交并等待完成（一步到位，不分配 NPU 卡）
+  task-submit --no-device --run "command"      不占卡执行（编译 / CPU 测试）
+  task-submit "command"                        提交任务，返回 task-id（默认不分配 NPU 卡）
+  task-submit --run "command"                  提交并等待完成（一步到位，默认不分配 NPU 卡）
   task-submit --device auto --run "..."        自动分配空闲 NPU 卡
   task-submit --device auto --device-num 2 --run "..."  自动分配 2 张空闲 NPU 卡
   task-submit --device N --run "..."           指定 NPU 卡号
@@ -142,6 +157,8 @@ task-submit — 提交任务到 root 执行队列
                                                设备列表形如 "2,3,4,5"，reset 清除运行时覆盖
 
 选项:
+  --no-device     不分配 NPU 卡（默认行为，写出来更明确）。与 --device-num 同用会报错；
+                  也别和 --device 混写（后写的生效）
   --timeout N     设置等待超时(秒)，可放在任意子命令前
   --device auto   自动分配空闲 NPU 卡（需要 NPU 时必须指定）
   --device-num N  自动分配 N 张空闲 NPU 卡（需配合 --device auto，或单独使用）
@@ -160,6 +177,9 @@ task-submit — 提交任务到 root 执行队列
   --max-time N    任务最大执行时间(秒，默认 300，0=不限)
 
 示例:
+  # 不占卡：编译、CPU 测试
+  task-submit --no-device --run "make build"
+
   # NPU 任务（自动分配卡）
   task-submit --device auto --run "python train.py"
 
@@ -172,9 +192,6 @@ task-submit — 提交任务到 root 执行队列
 
   # 指定卡号
   task-submit --device 0 --run "python train.py"
-
-  # 非 NPU 任务（不指定 --device 即可）
-  task-submit --run "make build"
 
   # 传递自定义环境变量
   task-submit --device auto --env WANDB_PROJECT --env SEED=42 --run "python train.py"
