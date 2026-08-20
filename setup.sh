@@ -431,6 +431,7 @@ fi
 install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
 install_app_file "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon" 755
 install_app_file "$SCRIPT_DIR/schedulers/backfill.sh" "$SCHEDULER_APP_DIR/backfill.sh" 644
+install_app_file "$SCRIPT_DIR/schedulers/pool_aware_reservation.sh" "$SCHEDULER_APP_DIR/pool_aware_reservation.sh" 644
 install_app_file "$SCRIPT_DIR/npu_lock.sh" "$APP_DIR/npu_lock.sh" 755
 install_app_file "$SCRIPT_DIR/pto-task-auto-update.sh" "$APP_DIR/pto-task-auto-update" 755
 install_app_file "$SCRIPT_DIR/pto-task-usage-sampler.sh" "$APP_DIR/pto-task-usage-sampler" 755

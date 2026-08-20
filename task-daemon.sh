@@ -787,6 +787,7 @@ load_scheduler() {
 
     case "$SCHEDULER_MODE" in
         backfill) scheduler_module="$scheduler_dir/backfill.sh" ;;
+        pool_aware_reservation) scheduler_module="$scheduler_dir/pool_aware_reservation.sh" ;;
         *)
             echo "error: unsupported SCHEDULER_MODE '$SCHEDULER_MODE'" >&2
             return 1
@@ -817,6 +818,9 @@ load_scheduler() {
     if [[ "${SCHEDULER_MODULE_API_VERSION:-}" != 1 ]] ||
        ! declare -F scheduler_schedule_tick >/dev/null; then
         echo "error: scheduler '$SCHEDULER_MODE' does not implement API version 1" >&2
+        return 1
+    fi
+    if declare -F scheduler_validate_config >/dev/null && ! scheduler_validate_config; then
         return 1
     fi
 }
