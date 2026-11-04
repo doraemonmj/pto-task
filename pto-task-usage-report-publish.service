@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish PTO Task daily usage to Feishu
+
+[Service]
+Type=oneshot
+ExecStart=/home/pypto-tools/pto-task/app/usage_report.py publish
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

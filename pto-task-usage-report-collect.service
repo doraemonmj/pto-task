@@ -1,0 +1,9 @@
+[Unit]
+Description=Archive PTO Task usage and login sessions
+
+[Service]
+Type=oneshot
+ExecStart=/home/pypto-tools/pto-task/app/usage_report.py collect
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

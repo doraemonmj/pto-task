@@ -242,6 +242,34 @@ Samples are stored in `state/usage/YYYYMMDD.csv`. The sampler uses a per-run
 lock and a timeout for every `npu-smi` call, so a stalled device cannot block
 the queue daemon.
 
+### Archived server usage and Feishu daily reports
+
+`task-submit --usage status` shows whether the independent collector is
+enabled. `task-submit --usage day --date YYYY-MM-DD` reads a local daily report.
+The collector archives completed task metadata and `wtmp` login sessions in
+`state/usage-report/usage.sqlite3`; it does not query NPU devices. Card-hours
+equal the task running interval within the day multiplied by assigned cards.
+Login hours are the union of known sessions, not active working time.
+
+The feature is **off by default**. Ask the administrator whether to enable it
+before setting `USAGE_REPORT_ENABLED=true` in `config/taskqueue.conf`:
+
+```bash
+USAGE_REPORT_ENABLED=true
+USAGE_SERVER_LABEL="686"
+USAGE_FEISHU_CONFIG="/home/pypto-tools/pto-simpler-perf-tracker/config/perf-tracker.env"
+USAGE_INDEX_DOCX_TOKEN=""  # other servers use the first server's index ID
+USAGE_HUB_STATE_FILE="/home/pypto-tools/pto-simpler-perf-tracker/state/usage-index.json" # hub server only
+```
+
+Run `sudo bash setup.sh` to install/enable the hourly collector and daily
+publisher timers; the daemon needs no restart. The publisher creates a usage
+index, one index per server, and weekly documents containing multiple days.
+It updates a date on retry and catches up after downtime. Credentials remain
+in the 0600 Feishu config. The hub server writes a document ID to
+`usage-index.json`, read by the performance tracker's report hub. Deploy a
+tracker version with this integration before enabling publication.
+
 ## Source checkout mode
 
 The Git checkout remains source only. Running `task-submit.sh`,
