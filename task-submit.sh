@@ -165,7 +165,8 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
   task-submit --status <task-id>               查看任务状态
   task-submit --log <task-id>                  查看任务日志（已完成或运行中）
   task-submit --stats [--days N]               查看 NPU 使用统计（默认近 7 天）
-  task-submit --usage status|day [--date YYYY-MM-DD]  查看归档使用统计
+  task-submit --usage status                    查看归档功能状态
+  sudo task-submit --usage day --date YYYY-MM-DD 查看管理员日统计
 
 管理:
   task-submit --list                           列出所有任务

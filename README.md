@@ -245,7 +245,8 @@ the queue daemon.
 ### Archived server usage and Feishu daily reports
 
 `task-submit --usage status` shows whether the independent collector is
-enabled. `task-submit --usage day --date YYYY-MM-DD` reads a local daily report.
+enabled. `sudo task-submit --usage day --date YYYY-MM-DD` reads a local daily
+report; the archive is administrator-only because it contains user sessions.
 The collector archives completed task metadata and `wtmp` login sessions in
 `state/usage-report/usage.sqlite3`; it does not query NPU devices. Card-hours
 equal the task running interval within the day multiplied by assigned cards.

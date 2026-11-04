@@ -110,7 +110,8 @@ rerun `sudo bash setup.sh` to install and enable its timer. The task daemon does
 not need a restart.
 
 For archived daily server usage, use `task-submit --usage status` and
-`task-submit --usage day --date YYYY-MM-DD`. `USAGE_REPORT_ENABLED` defaults to
+`sudo task-submit --usage day --date YYYY-MM-DD`. The archive is administrator
+only because it contains user sessions. `USAGE_REPORT_ENABLED` defaults to
 false. When configuring a server, **ask the user whether to enable this
 collector and Feishu publisher before setting it to true or activating its
 timers**. An install or update request alone does not answer that question.
