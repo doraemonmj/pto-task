@@ -54,6 +54,9 @@ def database(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
     os.chmod(path, 0o600)
+    if db.execute('PRAGMA auto_vacuum').fetchone()[0] != 1:
+        db.execute('PRAGMA auto_vacuum=FULL')
+        db.execute('VACUUM')
     db.executescript('''
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY, username TEXT NOT NULL, started REAL NOT NULL,
@@ -68,25 +71,32 @@ def database(path):
     return db
 
 
-def collect(db, state_dir, last_output=None):
+def collect(db, state_dir, last_output=None, retention_days=30, now=None):
+    now = datetime.now().timestamp() if now is None else now
+    cutoff = now - retention_days * 86400
     tasks = sessions = 0
     for path in (state_dir / 'done').glob('task_*'):
         if not path.is_file() or path.suffix == '.env':
             continue
         fields = {}
         try:
+            if path.stat().st_mtime < cutoff:
+                continue
             for line in path.read_text(errors='replace').splitlines():
                 key, sep, value = line.partition('=')
                 if sep and key in ('SUBMIT_USER', 'START_TIME', 'FINISH_TIME', 'DEVICE', 'EXIT_CODE'):
                     fields[key] = value
             if not all(fields.get(k) for k in ('SUBMIT_USER', 'START_TIME', 'FINISH_TIME')):
                 continue
+            finished = ts(fields['FINISH_TIME'])
+            if finished < cutoff:
+                continue
             db.execute('''INSERT INTO tasks VALUES (?,?,?,?,?,?)
                 ON CONFLICT(task_id) DO UPDATE SET username=excluded.username,
                 started=excluded.started, finished=excluded.finished,
                 devices=excluded.devices, exit_code=excluded.exit_code''',
                 (path.name, fields['SUBMIT_USER'], ts(fields['START_TIME']),
-                 ts(fields['FINISH_TIME']), fields.get('DEVICE', ''),
+                 finished, fields.get('DEVICE', ''),
                  int(fields['EXIT_CODE']) if fields.get('EXIT_CODE', '').lstrip('-').isdigit() else None))
             tasks += 1
         except (OSError, ValueError) as exc:
@@ -108,14 +118,21 @@ def collect(db, state_dir, last_output=None):
             continue
         finish = ts(dates[1]) if len(dates) > 1 else None
         state = 'closed' if finish else ('open' if 'still logged in' in line else 'unknown')
+        started = ts(dates[0])
+        if (finish is not None and finish < cutoff) or (state == 'unknown' and started < cutoff):
+            continue
         db.execute('''INSERT INTO sessions VALUES (?,?,?,?,?)
             ON CONFLICT(username,tty,started) DO UPDATE SET
             finished=excluded.finished,state=excluded.state''',
-            (parts[0], parts[1], ts(dates[0]), finish, state))
+            (parts[0], parts[1], started, finish, state))
         sessions += 1
+    db.execute('DELETE FROM tasks WHERE finished < ?', (cutoff,))
+    db.execute('DELETE FROM sessions WHERE finished < ? OR (state = ? AND started < ?)',
+               (cutoff, 'unknown', cutoff))
+    db.execute('DELETE FROM collections WHERE collected < ?', (cutoff,))
     db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)',
-               ('collected_at', datetime.now(timezone.utc).isoformat()))
-    db.execute('INSERT INTO collections VALUES (?)', (datetime.now().timestamp(),))
+               ('collected_at', datetime.fromtimestamp(now, timezone.utc).isoformat()))
+    db.execute('INSERT INTO collections VALUES (?)', (now,))
     db.commit()
     return tasks, sessions
 
@@ -173,6 +190,20 @@ def render_day(report):
     if not report['users']:
         lines.append('无记录')
     return '\n'.join(lines)
+
+
+def render_remote_day(report):
+    users = report['users'].values()
+    task_hours = sum(row['task_hours'] for row in users)
+    login_hours = sum(row['login_hours'] for row in report['users'].values())
+    return (f"{report['date']} | 用户 {len(report['users'])} | 任务 {report['task_count']} | "
+            f"运行 {task_hours:.2f} 小时 | 卡时 {report['card_hours']:.2f} | "
+            f"登录 {login_hours:.2f} 小时")
+
+
+def week_for_day(day):
+    year, week, _ = datetime.fromisoformat(day).date().isocalendar()
+    return f'{year}-W{week:02d}'
 
 
 class Feishu:
@@ -281,29 +312,35 @@ def publish(db, args, label, tz):
     else:
         days = [yesterday.isoformat()]
     state.setdefault('periods', {})
+    state.setdefault('days', {})
+    migration_pending = state.get('remote_format') != 'daily-summary-v1'
+    dirty_periods = set()
+    if migration_pending:
+        for day in state['days']:
+            state['days'][day] = render_remote_day(day_report(db, day, label, tz))
+            dirty_periods.add(week_for_day(day))
+        save()
     for day in days:
-        date = datetime.fromisoformat(day).date()
-        year, week, _ = date.isocalendar()
-        period = f'{year}-W{week:02d}'
+        period = week_for_day(day)
         if period not in state['periods']:
             state['periods'][period] = client.create(f'服务器 {label} · {period}')
             save()
         period_url = f'https://hw-native-sys.feishu.cn/docx/{state["periods"][period]}'
         client.ensure_link(state['server_index'], period_url, period)
-        state.setdefault('days', {})[day] = render_day(day_report(db, day, label, tz))
+        state['days'][day] = render_remote_day(day_report(db, day, label, tz))
+        dirty_periods.add(period)
         save()
-        lines = []
-        for recorded_date in sorted(state['days']):
-            recorded = datetime.fromisoformat(recorded_date).date()
-            recorded_year, recorded_week, _ = recorded.isocalendar()
-            if f'{recorded_year}-W{recorded_week:02d}' == period:
-                lines.extend(state['days'][recorded_date].splitlines())
+    for period in sorted(dirty_periods):
+        lines = [state['days'][day] for day in sorted(state['days'])
+                 if week_for_day(day) == period]
         client.replace(state['periods'][period], lines)
-        if not args.date:
-            state['latest_day'] = day
-            save()
+    if not args.date and days:
+        state['latest_day'] = days[-1]
+    state['remote_format'] = 'daily-summary-v1'
+    save()
     print(json.dumps({'usage_index': state['usage_index'], 'server_index': state['server_index'],
-                      'period_doc': state['periods'][period], 'dates': days}))
+                      'period_doc': state['periods'][week_for_day(days[-1])] if days else None,
+                      'dates': days}))
 
 
 def main():
@@ -316,6 +353,10 @@ def main():
     parser.add_argument('--usage-index')
     args = parser.parse_args()
     enabled = config_value(args.config, 'USAGE_REPORT_ENABLED', 'false').lower() in ('true', '1', 'yes')
+    retention_text = config_value(args.config, 'USAGE_RETENTION_DAYS', '30')
+    if not retention_text.isdigit() or not 7 <= int(retention_text) <= 90:
+        raise SystemExit('USAGE_RETENTION_DAYS must be between 7 and 90')
+    retention_days = int(retention_text)
     label = config_value(args.config, 'USAGE_SERVER_LABEL') or socket.gethostname()
     args.feishu_config = Path(config_value(args.config, 'USAGE_FEISHU_CONFIG')) if config_value(args.config, 'USAGE_FEISHU_CONFIG') else None
     args.usage_index = args.usage_index or config_value(args.config, 'USAGE_INDEX_DOCX_TOKEN')
@@ -323,7 +364,8 @@ def main():
     args.hub_state_file = Path(hub_path) if hub_path else None
     if args.command == 'status':
         print(json.dumps({'enabled': enabled, 'server_label': label, 'database': str(args.db),
-                          'feishu_configured': bool(args.feishu_config)}, ensure_ascii=False))
+                          'feishu_configured': bool(args.feishu_config),
+                          'retention_days': retention_days}, ensure_ascii=False))
         return
     if args.command in ('collect', 'publish') and not enabled:
         raise SystemExit('usage collection is disabled (USAGE_REPORT_ENABLED=false)')
@@ -333,7 +375,7 @@ def main():
     db = database(args.db)
     if args.command in ('collect', 'publish'):
         state_dir = args.state_dir or ROOT / 'state'
-        print('collected tasks/sessions:', *collect(db, state_dir))
+        print('collected tasks/sessions:', *collect(db, state_dir, retention_days=retention_days))
     if args.command == 'day':
         day = args.date or (datetime.now(tz).date() - timedelta(days=1)).isoformat()
         print(render_day(day_report(db, day, label, tz)))

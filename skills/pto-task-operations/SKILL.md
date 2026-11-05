@@ -123,6 +123,8 @@ only because it contains user sessions. `USAGE_REPORT_ENABLED` defaults to
 false. When configuring a server, **ask the user whether to enable this
 collector and Feishu publisher before setting it to true or activating its
 timers**. An install or update request alone does not answer that question.
+Local details expire after 30 days by default (`USAGE_RETENTION_DAYS`, 7–90);
+Feishu receives one server-wide summary per day without usernames.
 `USAGE_SERVER_LABEL` controls the Feishu display name (for example, `686`).
 See the README's archived server usage section for other settings. Do not
 present login duration as active working time.

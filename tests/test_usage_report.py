@@ -1,5 +1,7 @@
 import importlib.util
 from datetime import timezone
+import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +17,39 @@ spec.loader.exec_module(usage)
 
 
 class UsageReportTest(unittest.TestCase):
+    def test_collect_retains_recent_records_and_prunes_old_ones(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            done = root / 'done'
+            done.mkdir()
+            old = done / 'task_old'
+            old.write_text('\n'.join([
+                'SUBMIT_USER=alice', 'START_TIME=2026-09-30T00:00:00+00:00',
+                'FINISH_TIME=2026-09-30T01:00:00+00:00', 'DEVICE=0',
+            ]))
+            recent = done / 'task_recent'
+            recent.write_text('\n'.join([
+                'SUBMIT_USER=alice', 'START_TIME=2026-11-03T00:00:00+00:00',
+                'FINISH_TIME=2026-11-03T01:00:00+00:00', 'DEVICE=0,1',
+            ]))
+            now = usage.ts('2026-11-04T12:00:00+00:00')
+            os.utime(old, (now - 35 * 86400, now - 35 * 86400))
+            db = usage.database(root / 'usage.sqlite3')
+            db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?)',
+                       ('old_db_task', 'alice', now - 40 * 86400,
+                        now - 39 * 86400, '0', 0))
+            db.execute('INSERT INTO collections VALUES (?)', (now - 35 * 86400,))
+            db.commit()
+            last_output = '\n'.join([
+                'alice pts/1 2026-09-30T00:00:00+00:00 - 2026-09-30T01:00:00+00:00 (01:00)',
+                'alice pts/2 2026-11-03T00:00:00+00:00 - 2026-11-03T01:00:00+00:00 (01:00)',
+            ])
+            self.assertEqual(usage.collect(db, root, last_output, now=now), (1, 1))
+            self.assertEqual(db.execute('SELECT task_id FROM tasks').fetchall(), [('task_recent',)])
+            self.assertEqual(db.execute('SELECT tty FROM sessions').fetchall(), [('pts/2',)])
+            self.assertEqual(db.execute('SELECT collected FROM collections').fetchall(), [(now,)])
+            self.assertEqual(db.execute('PRAGMA auto_vacuum').fetchone()[0], 1)
+
     def test_dst_day_uses_local_calendar_boundaries(self):
         with tempfile.TemporaryDirectory() as temp:
             db = usage.database(Path(temp) / 'usage.sqlite3')
@@ -45,8 +80,9 @@ class UsageReportTest(unittest.TestCase):
                 'wtmp begins 2026-11-01T00:00:00+00:00',
             ])
             db = usage.database(root / 'usage.sqlite3')
-            usage.collect(db, root, last_output)
-            usage.collect(db, root, last_output)
+            now = usage.ts('2026-11-03T12:00:00+00:00')
+            usage.collect(db, root, last_output, now=now)
+            usage.collect(db, root, last_output, now=now + 1)
             first = usage.day_report(db, '2026-11-01', '686', timezone.utc)['users']['alice']
             second = usage.day_report(db, '2026-11-02', '686', timezone.utc)['users']['alice']
             self.assertEqual(first['tasks'], 1)
@@ -96,10 +132,29 @@ class UsageReportTest(unittest.TestCase):
             with patch.object(usage, 'Feishu', FakeFeishu):
                 usage.publish(db, args, '686', timezone.utc)
                 usage.publish(db, args, '686', timezone.utc)
+                state_file = root / 'publish-state.json'
+                state = json.loads(state_file.read_text())
+                period_doc = state['periods']['2026-W45']
+                self.assertEqual(len(FakeFeishu.docs[period_doc]), 1)
+                self.assertIn('任务 1', FakeFeishu.docs[period_doc][0])
+                self.assertIn('卡时 2.00', FakeFeishu.docs[period_doc][0])
+                self.assertNotIn('alice', FakeFeishu.docs[period_doc][0])
+                state['days']['2026-11-02'] = '2026-11-02 任务 1\nalice | 1 | 1.00 | 2.00'
+                state.pop('remote_format')
+                state_file.write_text(json.dumps(state))
+                FakeFeishu.docs[period_doc] = state['days']['2026-11-02'].splitlines()
+                args.date = '2026-11-03'
+                usage.publish(db, args, '686', timezone.utc)
             self.assertEqual(FakeFeishu.sequence, 3)
-            state = __import__('json').loads((root / 'publish-state.json').read_text())
+            state = json.loads((root / 'publish-state.json').read_text())
             self.assertEqual(list(state['periods']), ['2026-W45'])
-            self.assertEqual(sum('2026-11-02' in line for line in FakeFeishu.docs[state['periods']['2026-W45']]), 1)
+            self.assertEqual(state['remote_format'], 'daily-summary-v1')
+            lines = FakeFeishu.docs[state['periods']['2026-W45']]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(sum('2026-11-02' in line for line in lines), 1)
+            self.assertEqual(sum('2026-11-03' in line for line in lines), 1)
+            self.assertTrue(all('alice' not in line and '\n' not in line for line in lines))
+            self.assertIn('alice |', usage.render_day(usage.day_report(db, '2026-11-02', '686', timezone.utc)))
 
 
 if __name__ == '__main__':
