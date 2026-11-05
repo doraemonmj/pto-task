@@ -5,7 +5,7 @@
 #   task-submit --run "command"                     提交并等待完成（一步到位）
 #   task-submit --device 0 "command"                提交并自动锁 NPU 设备
 #   task-submit --wait <task-id>                    等待任务完成并输出结果
-#   task-submit --timeout 600 --wait <task-id>      自定义超时
+#   task-submit --timeout 600 --wait <task-id>      自定义排队超时
 #   task-submit --status <task-id>                  查看任务状态
 #   task-submit --log <task-id>                     查看任务日志
 #   task-submit --cancel <task-id>                  取消 pending 任务
@@ -102,6 +102,8 @@ CONF_GROUP_AFFINITY=0
 GROUP_AFFINITY_EFFECTIVE=0
 declare -A DEVICE_GROUP_OF=()
 DEVICE_GROUP_MAP_LOADED=0
+CONF_ALLOCATION_POOLS=""
+DEVICE_STATUS_MODE=0
 # 关闭同组约束：供确实需要跨 plane 的负载（如 torch_npu 纯 HCCL collective 加
 # RoCE）放行。触发：--ignore-group-affinity 或 TASKQUEUE_IGNORE_GROUP_AFFINITY=1。
 IGNORE_GROUP_AFFINITY=0
@@ -161,10 +163,12 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
 查询:
   task-submit --version                        显示已安装源码 revision
   task-submit --wait <task-id>                 等待任务完成并实时输出日志
-  task-submit --timeout N --wait <task-id>     自定义等待超时(秒，默认 600)
+  task-submit --timeout N --wait <task-id>     自定义排队超时(秒，默认 600)
   task-submit --status <task-id>               查看任务状态
   task-submit --log <task-id>                  查看任务日志（已完成或运行中）
   task-submit --stats [--days N]               查看 NPU 使用统计（默认近 7 天）
+  task-submit --usage status                    查看归档功能状态
+  sudo task-submit --usage day --date YYYY-MM-DD 查看管理员日统计
 
 管理:
   task-submit --list                           列出所有任务
@@ -181,7 +185,7 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
 选项:
   --no-device     不分配 NPU 卡（默认行为，写出来更明确）。与 --device-num 同用会报错；
                   也别和 --device 混写（后写的生效）
-  --timeout N     设置等待超时(秒)，可放在任意子命令前
+  --timeout N     设置排队等待超时(秒)，任务运行后不再计时；0=一直等
   --device auto   自动分配空闲 NPU 卡（需要 NPU 时必须指定）
   --device-num N  自动分配 N 张空闲 NPU 卡（需配合 --device auto，或单独使用）
                   若每仓 task-submit.conf 配了 DEVICE_SEQ_<N>，则改为固定使用该卡号
@@ -193,6 +197,7 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
   --ignore-whitelist  忽略每仓 task-submit.conf 的 DEVICE_WHITELIST 上限，
                   --device auto 回退到全局可用设备（黑名单仍排除）；
                   等价于环境变量 TASKQUEUE_IGNORE_WHITELIST=1，供 daily CI 跑多卡用例超限
+                  分号分池的 DEVICE_WHITELIST 不支持此选项
   --ignore-group-affinity  关闭同组（HCCS plane）约束，允许多卡跨组分配。
                   仅当负载确实能跨 plane 通信时使用（如 torch_npu 纯 HCCL
                   collective 加 RoCE）；pypto/simpler 跨组会挂起并楔死卡。
@@ -277,7 +282,7 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
             PTOAS_VERSION="$2"; shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
-        --version|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--help|-h)
+        --version|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--help|-h)
             break ;;
         # 未知选项必须硬失败。此处曾是 `*) break`，会把未识别的 flag 连同其后的
         # --run/--timeout 一起当作任务命令提交，且 RUN_MODE 未置位时静默 exit 0
@@ -555,6 +560,18 @@ load_device_conf() {
     CONF_WHITELIST_RAW="$(read_conf_field DEVICE_WHITELIST "$conf")"
     CONF_BLACKLIST_RAW="$(read_conf_field DEVICE_BLACKLIST "$conf")"
     CONF_WHITELIST="$CONF_WHITELIST_RAW"
+    if [[ "$CONF_WHITELIST_RAW" == *';'* ]]; then
+        if ! allocation_pools_valid "$CONF_WHITELIST_RAW"; then
+            if [[ "$DEVICE_STATUS_MODE" != 1 ]]; then
+                echo "${C_RED}错误: $conf 中 DEVICE_WHITELIST 分池格式无效: '$CONF_WHITELIST_RAW'${C_RESET}" >&2
+                echo "${C_DIM}应为不重叠的分号分池、池内逗号分卡，如 DEVICE_WHITELIST=\"0,1,2,3;4,5,6,7\"；卡号不能带前导零${C_RESET}" >&2
+                exit 1
+            fi
+        else
+            CONF_ALLOCATION_POOLS="$CONF_WHITELIST_RAW"
+            CONF_WHITELIST="${CONF_WHITELIST_RAW//;/,}"
+        fi
+    fi
     CONF_BLACKLIST="$CONF_BLACKLIST_RAW"
     CONF_GROUP_AFFINITY_RAW="$(read_conf_field DEVICE_GROUP_AFFINITY "$conf")"
     case "$CONF_GROUP_AFFINITY_RAW" in
@@ -585,6 +602,17 @@ device_groups_valid() {
         done
     done
     return 0
+}
+
+allocation_pools_valid() {
+    local spec="$1" group
+    local -a groups
+    [[ "$spec" == *';'* && "$spec" != *';' ]] || return 1
+    device_groups_valid "$spec" || return 1
+    IFS=';' read -ra groups <<< "$spec"
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || return 1
+    done
 }
 
 load_device_group_map() {
@@ -738,8 +766,21 @@ show_device_policy_sources() {
 
     if [[ -n "$DEVICE_CONF_PATH" ]]; then
         echo "  ${C_CYAN}仓库配置${C_RESET}   $DEVICE_CONF_PATH"
-        echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST_RAW")"
-        show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+        if [[ -n "$CONF_ALLOCATION_POOLS" ]]; then
+            echo "    DEVICE_WHITELIST=$CONF_ALLOCATION_POOLS（分号分池；跨池不分配）"
+            if [[ "$IGNORE_WHITELIST" == "1" ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: 分池白名单不可使用 --ignore-whitelist"
+                whitelist_valid=0
+            fi
+        else
+            echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST_RAW")"
+            if [[ "$CONF_WHITELIST_RAW" == *';'* ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: DEVICE_WHITELIST 分池格式无效（分号分池、卡号不得重复或带前导零）"
+                whitelist_valid=0
+            else
+                show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+            fi
+        fi
         echo "    DEVICE_BLACKLIST=$(format_device_pool "$CONF_BLACKLIST_RAW")"
         show_device_list_health "      " "DEVICE_BLACKLIST" "$CONF_BLACKLIST_RAW" || blacklist_valid=0
         echo "    DEVICE_GROUP_AFFINITY=${CONF_GROUP_AFFINITY_RAW:-未设置}"
@@ -767,11 +808,11 @@ show_device_policy_sources() {
     # Preserve the existing policy precedence for compatibility. Only require
     # the selected base source to be valid: an invalid but overridden env pool,
     # or a whitelist explicitly ignored by the user, does not affect allocation.
-    if [[ "$IGNORE_WHITELIST" == "1" || -z "$CONF_WHITELIST_RAW" ]]; then
+    if [[ "$IGNORE_WHITELIST" == "1" && -z "$CONF_ALLOCATION_POOLS" || -z "$CONF_WHITELIST_RAW" ]]; then
         base="${ENV_DEVICE_POOL:-$GLOBAL_AUTO_POOL}"
         [[ -z "$ENV_DEVICE_POOL" || "$env_valid" == "1" ]] || base_valid=0
     else
-        base="$CONF_WHITELIST_RAW"
+        base="$CONF_WHITELIST"
         [[ "$whitelist_valid" == "1" ]] || base_valid=0
         if [[ -n "$ENV_DEVICE_POOL" ]]; then
             echo "  ${C_YELLOW}兼容提示${C_RESET}: 仓库白名单优先于 TASKQUEUE_DEVICE_POOL；当前未改动该历史行为"
@@ -783,6 +824,19 @@ show_device_policy_sources() {
         effective="$(device_list_intersection "$GLOBAL_AUTO_POOL" "$base")"
         outside="$(device_list_difference "$base" "$GLOBAL_AUTO_POOL")"
         echo "  ${C_BOLD}最终 auto 候选${C_RESET} $(format_device_pool "$effective")"
+        if [[ -n "$CONF_ALLOCATION_POOLS" ]]; then
+            local group candidate max_pool=0 count
+            local -a allocation_groups
+            IFS=';' read -ra allocation_groups <<< "$CONF_ALLOCATION_POOLS"
+            echo "  ${C_BOLD}逻辑分池候选${C_RESET}"
+            for group in "${allocation_groups[@]}"; do
+                candidate="$(device_list_intersection "$effective" "$group")"
+                count="$(device_list_count "$candidate")"
+                (( count > max_pool )) && max_pool=$count
+                echo "    $(format_device_pool "$candidate")  原池=[$group]"
+            done
+            echo "  ${C_BOLD}分池单次上限${C_RESET} ${max_pool} 张（不跨池凑卡）"
+        fi
         [[ -z "$outside" ]] || echo "  ${C_YELLOW}冲突${C_RESET}: 项目/环境策略中的 $(format_device_pool "$outside") 不在全局生效池，daemon 不会分配"
         [[ -n "$effective" ]] || echo "  ${C_RED}冲突${C_RESET}: 各层策略交集为空，auto 任务无法获得设备"
         if [[ "$CONF_GROUP_AFFINITY" == "1" && "$IGNORE_GROUP_AFFINITY" != "1" &&
@@ -930,6 +984,11 @@ apply_device_sequence() {
 apply_device_policy() {
     is_auto_device_request || return 0
 
+    if [[ "$IGNORE_WHITELIST" == "1" && -n "$CONF_ALLOCATION_POOLS" ]]; then
+        echo "${C_RED}错误: 分池 DEVICE_WHITELIST 不支持 --ignore-whitelist；该选项会破坏同池分配约束${C_RESET}" >&2
+        exit 1
+    fi
+
     # 超限开关：忽略每仓白名单上限（黑名单仍生效）。
     # 把 CONF_WHITELIST 清空，后续候选基集自然回退到卡组/全局白名单，
     # 但下面的黑名单扣除逻辑不受影响。
@@ -1014,6 +1073,66 @@ validate_device_count() {
         echo "${C_DIM}请减小 --device-num，或扩大白名单/全局可用设备(task-submit --devices)${C_RESET}" >&2
         exit 1
     fi
+}
+
+# A grouped whitelist is a scheduling boundary independent of HCCS topology.
+# Reject impossible auto requests and explicit/sequence requests spanning pools.
+validate_allocation_pools() {
+    [[ -n "$CONF_ALLOCATION_POOLS" ]] || return 0
+    [[ "$DEVICE_STATUS_MODE" == 1 ]] && return 0
+    local request need candidates group id count max=0 matched=0 physical key index=0
+    local -a groups members requested
+    local -A joint_counts=()
+    request="$(build_device_request)"
+    need="$(device_request_count "$request")"
+    (( need > 0 )) || return 0
+    if [[ "$IGNORE_WHITELIST" == "1" ]]; then
+        echo "${C_RED}错误: 分池 DEVICE_WHITELIST 不支持 --ignore-whitelist${C_RESET}" >&2
+        exit 1
+    fi
+    IFS=';' read -ra groups <<< "$CONF_ALLOCATION_POOLS"
+    if is_auto_device_request; then
+        candidates="$(device_list_intersection "$GLOBAL_AUTO_POOL" "${DEVICE_POOL:-$GLOBAL_AUTO_POOL}")"
+        for group in "${groups[@]}"; do
+            count=0
+            IFS=',' read -ra members <<< "$group"
+            for id in "${members[@]}"; do
+                if [[ ",$candidates," == *",$id,"* ]]; then
+                    count=$((count + 1))
+                    if [[ "$CONF_GROUP_AFFINITY" == 1 && "$IGNORE_GROUP_AFFINITY" != 1 && -n "$DEVICE_GROUPS" ]]; then
+                        physical="$(device_group_of "$id")"
+                        key="${index}_${physical}"
+                        joint_counts["$key"]=$(( ${joint_counts[$key]:-0} + 1 ))
+                    fi
+                fi
+            done
+            (( count > max )) && max=$count
+            index=$((index + 1))
+        done
+        if (( ${#joint_counts[@]} > 0 )); then
+            max=0
+            for key in "${!joint_counts[@]}"; do
+                (( joint_counts[$key] > max )) && max=${joint_counts[$key]}
+            done
+        fi
+        if (( max < need )); then
+            echo "${C_RED}错误: 请求 ${need} 张卡，但分池白名单中最大的有效池只有 ${max} 张，任务无法满足${C_RESET}" >&2
+            echo "${C_DIM}分池: $CONF_ALLOCATION_POOLS（见 $DEVICE_CONF_PATH）${C_RESET}" >&2
+            exit 1
+        fi
+        return 0
+    fi
+    IFS=',' read -ra requested <<< "$request"
+    for group in "${groups[@]}"; do
+        matched=0
+        for id in "${requested[@]}"; do
+            [[ ",$group," == *",$id,"* ]] && matched=$((matched + 1))
+        done
+        (( matched == need )) && return 0
+    done
+    echo "${C_RED}错误: --device/DEVICE_SEQ 请求 [$request] 不在同一个 DEVICE_WHITELIST 分池内${C_RESET}" >&2
+    echo "${C_DIM}分池: $CONF_ALLOCATION_POOLS（见 $DEVICE_CONF_PATH）${C_RESET}" >&2
+    exit 1
 }
 
 # 同组校验：本仓 DEVICE_GROUP_AFFINITY=1 时，多卡任务的卡必须落在同一个 HCCS
@@ -1102,6 +1221,7 @@ if is_auto_device_request; then
 elif [[ -n "$LOCK_DEVICE" && "$LOCK_DEVICE" != "none" ]]; then
     DEVICE_REQUEST_ORIGIN="explicit"
 fi
+[[ "${1:-}" == "--devices" ]] && DEVICE_STATUS_MODE=1
 if [[ "${1:-}" == "--devices" ]]; then
     load_global_auto_pool 1
 else
@@ -1112,6 +1232,7 @@ apply_device_sequence
 apply_device_policy
 validate_device_pool
 validate_device_count
+validate_allocation_pools
 validate_device_group_affinity
 
 # --interactive 必须搭配 --run（需要实时终端）
@@ -1253,6 +1374,7 @@ COMMAND=$cmd
 DEVICE=$device_request
 DEVICE_AUTO=$(is_auto_device_request && echo 1 || echo 0)
 DEVICE_POOL=$DEVICE_POOL
+DEVICE_ALLOCATION_POOLS=$CONF_ALLOCATION_POOLS
 DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
 DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
 DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE
@@ -1432,22 +1554,26 @@ wait_task() {
     trap '_sig_exit=130; _wait_cleanup' INT
     trap '_sig_exit=143; _wait_cleanup' TERM HUP
 
-    # 等待超时：客户端就此退出，任务必须一并了结，否则会变成无主僵尸继续排队 ——
+    # 排队超时：客户端就此退出，任务必须一并了结，否则会变成无主僵尸继续排队 ——
     # 它可能在几十分钟后突然被调度，独占整机的卡去跑一个早已无人认领的结果。
     # （2026-07-14：两个 auto:8 的 CI 任务超时后又排了 47 分钟，随后自行启动并抢走全部 8 张卡。）
-    # 仍在 pending 则取消；已经 running 则交给 daemon 的 max-time watchdog，不在此强杀，
-    # 以免破坏 “断开后可用 --wait 重连” 的语义。
-    _wait_timeout() {
-        [[ -n "$stdin_fwd_pid" ]] && kill "$stdin_fwd_pid" 2>/dev/null && wait "$stdin_fwd_pid" 2>/dev/null
-        [[ -n "$tail_pid" ]] && kill "$tail_pid" 2>/dev/null && wait "$tail_pid" 2>/dev/null
-        echo "${C_RED}错误: 等待超时 (${TIMEOUT}s)${C_RESET}" >&2
-        if [[ -f "$PENDING_DIR/$task_id" ]]; then
-            rm -f "$PENDING_DIR/$task_id" "$PENDING_DIR/${task_id}.env"
-            echo "${C_YELLOW}已取消仍在排队的任务: $task_id（超时前未分配到设备）${C_RESET}" >&2
-        elif [[ -f "$RUNNING_DIR/$task_id" ]]; then
-            echo "${C_YELLOW}任务仍在运行，将由 daemon 在 --max-time 到期后终止${C_RESET}" >&2
-            echo "${C_DIM}重连: task-submit --wait $task_id    立即终止: task-submit --kill $task_id${C_RESET}" >&2
+    # daemon 可能在检查截止时间与删除 pending 文件之间完成认领；这种情况下
+    # 继续等待执行结果，不把运行中的任务误报为排队超时。
+    _wait_queue_timeout() {
+        if [[ -f "$RUNNING_DIR/$task_id" || -f "$DONE_DIR/$task_id" ]]; then
+            return 0
         fi
+        if ! rm -f "$PENDING_DIR/$task_id"; then
+            echo "${C_RED}错误: 排队超时，但无法取消任务: $task_id${C_RESET}" >&2
+            trap - INT TERM HUP
+            exit 1
+        fi
+        if [[ -f "$RUNNING_DIR/$task_id" || -f "$DONE_DIR/$task_id" ]]; then
+            return 0
+        fi
+        rm -f "$PENDING_DIR/${task_id}.env"
+        echo "${C_RED}错误: 排队等待超时 (${TIMEOUT}s)${C_RESET}" >&2
+        echo "${C_YELLOW}已取消仍在排队的任务: $task_id（超时前未分配到设备）${C_RESET}" >&2
         trap - INT TERM HUP
         exit 1
     }
@@ -1463,18 +1589,22 @@ wait_task() {
     fi
 
     echo "${C_DIM}等待任务执行: $task_id (Ctrl+C 终止任务)${C_RESET}" >&2
-    while [[ ! -f "$log_file" ]] && [[ $TIMEOUT -eq 0 || $elapsed_ms -lt $timeout_ms ]]; do
+    while [[ ! -f "$log_file" && ! -f "$DONE_DIR/$task_id" ]]; do
+        if [[ ! -f "$PENDING_DIR/$task_id" && ! -f "$RUNNING_DIR/$task_id" &&
+              ! -f "$DONE_DIR/$task_id" ]]; then
+            echo "${C_RED}错误: 任务不存在或已取消: $task_id${C_RESET}" >&2
+            trap - INT TERM HUP
+            exit 1
+        fi
+        if [[ -f "$PENDING_DIR/$task_id" && "$TIMEOUT" -ne 0 &&
+              "$elapsed_ms" -ge "$timeout_ms" ]]; then
+            _wait_queue_timeout
+        fi
         sleep 0.2
-        elapsed_ms=$((elapsed_ms + 200))
-        # 也可能在等待中就完成了
-        if [[ -f "$DONE_DIR/$task_id" ]]; then
-            break
+        if [[ -f "$PENDING_DIR/$task_id" ]]; then
+            elapsed_ms=$((elapsed_ms + 200))
         fi
     done
-
-    if [[ ! -f "$log_file" ]] && [[ $TIMEOUT -ne 0 && $elapsed_ms -ge $timeout_ms ]]; then
-        _wait_timeout
-    fi
 
     # 实时跟踪日志。必须 -n +1：tail 默认只从最后 10 行开始跟随，而 tail 挂上来之前
     # 任务往往已经输出了几十行（8 卡任务光 npu-lock 就有 16 行），开头会被静默吞掉 ——
@@ -1499,9 +1629,8 @@ wait_task() {
             done
         fi
     else
-        while [[ ! -f "$DONE_DIR/$task_id" ]] && [[ $TIMEOUT -eq 0 || $elapsed_ms -lt $timeout_ms ]]; do
+        while [[ ! -f "$DONE_DIR/$task_id" ]]; do
             sleep 0.2
-            elapsed_ms=$((elapsed_ms + 200))
         done
     fi
 
@@ -1524,7 +1653,8 @@ wait_task() {
         trap - INT TERM HUP
         exit "${exit_code:-1}"
     else
-        _wait_timeout
+        echo "${C_RED}错误: 等待任务结果中断: $task_id${C_RESET}" >&2
+        exit 1
     fi
 }
 
@@ -2044,6 +2174,10 @@ case "${1:-}" in
         else
             exec bash "$SCRIPT_DIR/pto-task-stats.sh" "${@:2}"
         fi
+        ;;
+    --usage)
+        shift
+        exec python3 "$SCRIPT_DIR/usage_report.py" "${@:-status}"
         ;;
     --help|-h|"")
         usage

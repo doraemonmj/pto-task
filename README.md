@@ -116,9 +116,11 @@ access. `PTOAS_ROOT`, `ASCEND_HOME_PATH`, `GCC15_ROOT`, `CLANG_FORMAT`, and
 `MODELS_ROOT` are supported; `GCC15_ROOT` is optional and unset by default.
 Legacy root-owned `/etc/pypto-env.conf` is imported on first install when safe.
 
-`--max-time` defaults to 300 seconds; `--timeout` defaults to 600 seconds and
-only controls client waiting. Project-local `task-submit.conf` device policies
-and the existing `TASKQUEUE_DEVICE_*` environment controls continue to work.
+`--max-time` defaults to 300 seconds and limits execution after the task starts.
+`--timeout` defaults to 600 seconds and limits only the pending queue wait;
+once the task starts, the client waits for the daemon's result. Project-local
+`task-submit.conf` device policies and the existing `TASKQUEUE_DEVICE_*`
+environment controls continue to work.
 `task-submit --devices status` reports every auto-pool source, the discovered
 project policy, the effective intersection used by the daemon, and conflicts
 such as fixed sequences outside the global auto pool. Malformed lists,
@@ -241,6 +243,43 @@ USAGE_SAMPLING_ENABLED=true
 Samples are stored in `state/usage/YYYYMMDD.csv`. The sampler uses a per-run
 lock and a timeout for every `npu-smi` call, so a stalled device cannot block
 the queue daemon.
+
+### Archived server usage and Feishu daily reports
+
+`task-submit --usage status` shows whether the independent collector is
+enabled. `sudo task-submit --usage day --date YYYY-MM-DD` reads a local daily
+report; the archive is administrator-only because it contains user sessions.
+The collector archives completed task metadata and `wtmp` login sessions in
+`state/usage-report/usage.sqlite3`; it does not query NPU devices. Card-hours
+equal the task running interval within the day multiplied by assigned cards.
+Login hours are the union of known sessions, not active working time.
+Local task, session, and collection records are retained for 30 days by
+default (`USAGE_RETENTION_DAYS`, allowed range 7–90); SQLite reclaims deleted
+pages automatically. Published daily summaries remain in Feishu.
+
+The feature is **off by default**. Ask the administrator whether to enable it
+before setting `USAGE_REPORT_ENABLED=true` in `config/taskqueue.conf`:
+
+```bash
+USAGE_REPORT_ENABLED=true
+USAGE_SERVER_LABEL="686"
+USAGE_RETENTION_DAYS=30
+USAGE_TIMEZONE="Asia/Shanghai" # 按服务器实际时区填写；本机为 America/Los_Angeles
+USAGE_FEISHU_CONFIG="/home/pypto-tools/pto-simpler-perf-tracker/config/perf-tracker.env"
+USAGE_INDEX_DOCX_TOKEN=""  # other servers use the first server's index ID
+USAGE_HUB_STATE_FILE="/home/pypto-tools/pto-simpler-perf-tracker/state/usage-index.json" # hub server only
+```
+
+Run `sudo bash setup.sh` to install/enable the hourly collector and daily
+publisher timers; the daemon needs no restart. The publisher creates a usage
+index, one index per server, and weekly documents containing multiple days.
+Each Feishu day is one server-wide summary without usernames; detailed user
+records stay in the administrator-only local SQLite archive.
+New documents are readable by members of the Feishu tenant who have the link.
+It updates a date on retry and catches up after downtime. Credentials remain
+in the 0600 Feishu config. The hub server writes a document ID to
+`usage-index.json`, read by the performance tracker's report hub. Deploy a
+tracker version with this integration before enabling publication.
 
 ## Source checkout mode
 

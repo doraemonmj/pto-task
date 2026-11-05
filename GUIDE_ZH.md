@@ -158,7 +158,7 @@ task-submit --run "pytest tests/test_foo.py"
 # 长训练（默认 300 秒会被 kill，必须加 --max-time 0）
 task-submit --device auto --max-time 0 --run "python train.py"
 
-# 一直等到任务结束（--timeout 0 = 客户端不超时）
+# 排队和执行都不限时
 task-submit --device auto --max-time 0 --timeout 0 --run "python train.py"
 
 # 交互式任务（执行过程中可以从终端输入）
@@ -209,6 +209,21 @@ task-submit --find "<子串>"          # 按完整命令匹配，只输出 task-
 `AVAILABLE_DEVICES`、自动探测结果、`TASKQUEUE_DEVICE_POOL`，以及从当前目录向上
 找到的 `task-submit.conf`。输出还会计算 daemon 最终可分配的 auto 候选集合，并
 提示空交集、被全局池排除的卡和固定 `DEVICE_SEQ_N` 超出全局池等兼容行为。
+
+### 项目逻辑分池
+
+只需在项目的 `task-submit.conf` 中把 `DEVICE_WHITELIST` 写成分号分池形式：
+
+```bash
+DEVICE_WHITELIST="0,1,2,3;4,5,6,7"
+```
+
+`task-submit --device auto --device-num 4` 会选择任一有四张空闲卡的池；两池
+各空两张时继续排队，不跨池凑卡。若各池与全局卡池、项目黑名单取交集后都少于四张，
+提交时直接报错。显式 `--device` 和 `DEVICE_SEQ_4` 也必须完全落在同一池；
+分池格式不能用 `--ignore-whitelist` 绕过。逗号列表（无分号）的旧行为不变。
+此规则只约束调度，独立于下面描述硬件通信域的 `DEVICE_GROUPS`；若两者同时启用，
+分配结果必须同时满足两种约束。用 `task-submit --devices status` 查看各池有效候选。
 
 ### 同 HCCS plane 借卡（卡组）
 
@@ -261,10 +276,11 @@ task-submit --clean --days 7        # 清理 7 天前完成的任务
 | 参数 | 作用 | 默认 | `0` 的含义 |
 |---|---|---|---|
 | `--max-time N` | 服务端的任务最大运行时间，超时被 kill | `300` 秒 | 不限时 |
-| `--timeout N` | 客户端等待时间 | `600` 秒 | 一直等 |
+| `--timeout N` | 客户端排队等待上限；任务开始运行后停止计时 | `600` 秒 | 排队不限时 |
 
-`--timeout` 只是断开等待，**任务仍在运行**，可以用
-`task-submit --wait <task-id>` 重新连上。
+排队超过 `--timeout` 时，客户端取消仍在排队的任务并返回失败；任务已经进入
+running 后，客户端一直等待结果，实际执行时长由 daemon 的 `--max-time` 限制。
+`--max-time 0` 会取消执行上限，此时客户端也会一直等到任务结束。
 
 ## 注意事项
 

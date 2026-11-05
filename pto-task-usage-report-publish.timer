@@ -1,0 +1,10 @@
+[Unit]
+Description=Publish PTO Task usage daily
+
+[Timer]
+OnCalendar=*-*-* 01:15:00
+Persistent=true
+Unit=pto-task-usage-report-publish.service
+
+[Install]
+WantedBy=timers.target

@@ -71,6 +71,20 @@ simpler build their data plane on ACL VMM Fabric handles, which cannot be
 established across planes: the collective does not return an error, it hangs,
 and the cards stay unusable until the platform resets them out of band.
 
+For scheduling-only partitions, a repository can put semicolon-separated pools
+in its existing `DEVICE_WHITELIST`, for example
+`DEVICE_WHITELIST="0,1,2,3;4,5,6,7"`. A comma-only whitelist retains its old
+behavior. With semicolons, an auto four-card request takes all four cards from
+one available pool; two partially free pools are never combined. Each pool is
+intersected with the global auto list and the repository blacklist. A request
+larger than every effective pool fails at submission; a pool with enough total
+cards but too few currently free cards makes the request wait. Explicit card
+lists and `DEVICE_SEQ_N` must also fit in one pool. A card may occur in only
+one pool. `--ignore-whitelist` is refused for grouped whitelists, so it cannot
+disable the boundary. This policy is independent of `DEVICE_GROUPS`; when both
+are active, a request must fit within both one logical pool and one hardware
+group. The scheduler checks the boundary again immediately before locking.
+
 `MAX_CONCURRENT_8_CARD_TASKS` defaults to `0`, which preserves the historical
 scheduler behavior. Set it to `1` only in a host's local configuration when
 that server should keep additional eight-card jobs pending without blocking

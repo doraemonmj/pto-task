@@ -31,6 +31,14 @@ daemon restart.
 
 ## Scheduler policies
 
+`DEVICE_WHITELIST="0,1,2,3;4,5,6,7"` in a repository's `task-submit.conf`
+defines logical scheduling pools. Auto multi-card requests use one pool only;
+explicit lists and `DEVICE_SEQ_N` must also fit one pool. A comma-only list
+keeps the historical flat whitelist. Do not use `--ignore-whitelist` with a
+grouped whitelist. This is separate from host `DEVICE_GROUPS`, which describes
+hardware communication domains. Check `task-submit --devices status` and the
+effective per-pool capacity when diagnosing a waiting request.
+
 Select the root-managed policy with `SCHEDULER_MODE` in
 `<root>/config/taskqueue.conf`; change it only while pending and running are
 empty, then restart the daemon.
@@ -108,6 +116,18 @@ independent of the daemon and disabled by default. Set
 `USAGE_SAMPLING_ENABLED=true` in `<root>/config/taskqueue.conf` to enable it;
 rerun `sudo bash setup.sh` to install and enable its timer. The task daemon does
 not need a restart.
+
+For archived daily server usage, use `task-submit --usage status` and
+`sudo task-submit --usage day --date YYYY-MM-DD`. The archive is administrator
+only because it contains user sessions. `USAGE_REPORT_ENABLED` defaults to
+false. When configuring a server, **ask the user whether to enable this
+collector and Feishu publisher before setting it to true or activating its
+timers**. An install or update request alone does not answer that question.
+Local details expire after 30 days by default (`USAGE_RETENTION_DAYS`, 7–90);
+Feishu receives one server-wide summary per day without usernames.
+`USAGE_SERVER_LABEL` controls the Feishu display name (for example, `686`).
+See the README's archived server usage section for other settings. Do not
+present login duration as active working time.
 
 Start the daemon only when explicitly requested. `deploy.sh` is the explicit
 one-command install/update-and-activate entry point; `setup.sh` intentionally
