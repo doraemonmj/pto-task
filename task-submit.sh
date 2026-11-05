@@ -102,6 +102,8 @@ CONF_GROUP_AFFINITY=0
 GROUP_AFFINITY_EFFECTIVE=0
 declare -A DEVICE_GROUP_OF=()
 DEVICE_GROUP_MAP_LOADED=0
+CONF_ALLOCATION_POOLS=""
+DEVICE_STATUS_MODE=0
 # 关闭同组约束：供确实需要跨 plane 的负载（如 torch_npu 纯 HCCL collective 加
 # RoCE）放行。触发：--ignore-group-affinity 或 TASKQUEUE_IGNORE_GROUP_AFFINITY=1。
 IGNORE_GROUP_AFFINITY=0
@@ -195,6 +197,7 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
   --ignore-whitelist  忽略每仓 task-submit.conf 的 DEVICE_WHITELIST 上限，
                   --device auto 回退到全局可用设备（黑名单仍排除）；
                   等价于环境变量 TASKQUEUE_IGNORE_WHITELIST=1，供 daily CI 跑多卡用例超限
+                  分号分池的 DEVICE_WHITELIST 不支持此选项
   --ignore-group-affinity  关闭同组（HCCS plane）约束，允许多卡跨组分配。
                   仅当负载确实能跨 plane 通信时使用（如 torch_npu 纯 HCCL
                   collective 加 RoCE）；pypto/simpler 跨组会挂起并楔死卡。
@@ -557,6 +560,18 @@ load_device_conf() {
     CONF_WHITELIST_RAW="$(read_conf_field DEVICE_WHITELIST "$conf")"
     CONF_BLACKLIST_RAW="$(read_conf_field DEVICE_BLACKLIST "$conf")"
     CONF_WHITELIST="$CONF_WHITELIST_RAW"
+    if [[ "$CONF_WHITELIST_RAW" == *';'* ]]; then
+        if ! allocation_pools_valid "$CONF_WHITELIST_RAW"; then
+            if [[ "$DEVICE_STATUS_MODE" != 1 ]]; then
+                echo "${C_RED}错误: $conf 中 DEVICE_WHITELIST 分池格式无效: '$CONF_WHITELIST_RAW'${C_RESET}" >&2
+                echo "${C_DIM}应为不重叠的分号分池、池内逗号分卡，如 DEVICE_WHITELIST=\"0,1,2,3;4,5,6,7\"；卡号不能带前导零${C_RESET}" >&2
+                exit 1
+            fi
+        else
+            CONF_ALLOCATION_POOLS="$CONF_WHITELIST_RAW"
+            CONF_WHITELIST="${CONF_WHITELIST_RAW//;/,}"
+        fi
+    fi
     CONF_BLACKLIST="$CONF_BLACKLIST_RAW"
     CONF_GROUP_AFFINITY_RAW="$(read_conf_field DEVICE_GROUP_AFFINITY "$conf")"
     case "$CONF_GROUP_AFFINITY_RAW" in
@@ -587,6 +602,17 @@ device_groups_valid() {
         done
     done
     return 0
+}
+
+allocation_pools_valid() {
+    local spec="$1" group
+    local -a groups
+    [[ "$spec" == *';'* && "$spec" != *';' ]] || return 1
+    device_groups_valid "$spec" || return 1
+    IFS=';' read -ra groups <<< "$spec"
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || return 1
+    done
 }
 
 load_device_group_map() {
@@ -740,8 +766,21 @@ show_device_policy_sources() {
 
     if [[ -n "$DEVICE_CONF_PATH" ]]; then
         echo "  ${C_CYAN}仓库配置${C_RESET}   $DEVICE_CONF_PATH"
-        echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST_RAW")"
-        show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+        if [[ -n "$CONF_ALLOCATION_POOLS" ]]; then
+            echo "    DEVICE_WHITELIST=$CONF_ALLOCATION_POOLS（分号分池；跨池不分配）"
+            if [[ "$IGNORE_WHITELIST" == "1" ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: 分池白名单不可使用 --ignore-whitelist"
+                whitelist_valid=0
+            fi
+        else
+            echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST_RAW")"
+            if [[ "$CONF_WHITELIST_RAW" == *';'* ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: DEVICE_WHITELIST 分池格式无效（分号分池、卡号不得重复或带前导零）"
+                whitelist_valid=0
+            else
+                show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+            fi
+        fi
         echo "    DEVICE_BLACKLIST=$(format_device_pool "$CONF_BLACKLIST_RAW")"
         show_device_list_health "      " "DEVICE_BLACKLIST" "$CONF_BLACKLIST_RAW" || blacklist_valid=0
         echo "    DEVICE_GROUP_AFFINITY=${CONF_GROUP_AFFINITY_RAW:-未设置}"
@@ -769,11 +808,11 @@ show_device_policy_sources() {
     # Preserve the existing policy precedence for compatibility. Only require
     # the selected base source to be valid: an invalid but overridden env pool,
     # or a whitelist explicitly ignored by the user, does not affect allocation.
-    if [[ "$IGNORE_WHITELIST" == "1" || -z "$CONF_WHITELIST_RAW" ]]; then
+    if [[ "$IGNORE_WHITELIST" == "1" && -z "$CONF_ALLOCATION_POOLS" || -z "$CONF_WHITELIST_RAW" ]]; then
         base="${ENV_DEVICE_POOL:-$GLOBAL_AUTO_POOL}"
         [[ -z "$ENV_DEVICE_POOL" || "$env_valid" == "1" ]] || base_valid=0
     else
-        base="$CONF_WHITELIST_RAW"
+        base="$CONF_WHITELIST"
         [[ "$whitelist_valid" == "1" ]] || base_valid=0
         if [[ -n "$ENV_DEVICE_POOL" ]]; then
             echo "  ${C_YELLOW}兼容提示${C_RESET}: 仓库白名单优先于 TASKQUEUE_DEVICE_POOL；当前未改动该历史行为"
@@ -785,6 +824,19 @@ show_device_policy_sources() {
         effective="$(device_list_intersection "$GLOBAL_AUTO_POOL" "$base")"
         outside="$(device_list_difference "$base" "$GLOBAL_AUTO_POOL")"
         echo "  ${C_BOLD}最终 auto 候选${C_RESET} $(format_device_pool "$effective")"
+        if [[ -n "$CONF_ALLOCATION_POOLS" ]]; then
+            local group candidate max_pool=0 count
+            local -a allocation_groups
+            IFS=';' read -ra allocation_groups <<< "$CONF_ALLOCATION_POOLS"
+            echo "  ${C_BOLD}逻辑分池候选${C_RESET}"
+            for group in "${allocation_groups[@]}"; do
+                candidate="$(device_list_intersection "$effective" "$group")"
+                count="$(device_list_count "$candidate")"
+                (( count > max_pool )) && max_pool=$count
+                echo "    $(format_device_pool "$candidate")  原池=[$group]"
+            done
+            echo "  ${C_BOLD}分池单次上限${C_RESET} ${max_pool} 张（不跨池凑卡）"
+        fi
         [[ -z "$outside" ]] || echo "  ${C_YELLOW}冲突${C_RESET}: 项目/环境策略中的 $(format_device_pool "$outside") 不在全局生效池，daemon 不会分配"
         [[ -n "$effective" ]] || echo "  ${C_RED}冲突${C_RESET}: 各层策略交集为空，auto 任务无法获得设备"
         if [[ "$CONF_GROUP_AFFINITY" == "1" && "$IGNORE_GROUP_AFFINITY" != "1" &&
@@ -932,6 +984,11 @@ apply_device_sequence() {
 apply_device_policy() {
     is_auto_device_request || return 0
 
+    if [[ "$IGNORE_WHITELIST" == "1" && -n "$CONF_ALLOCATION_POOLS" ]]; then
+        echo "${C_RED}错误: 分池 DEVICE_WHITELIST 不支持 --ignore-whitelist；该选项会破坏同池分配约束${C_RESET}" >&2
+        exit 1
+    fi
+
     # 超限开关：忽略每仓白名单上限（黑名单仍生效）。
     # 把 CONF_WHITELIST 清空，后续候选基集自然回退到卡组/全局白名单，
     # 但下面的黑名单扣除逻辑不受影响。
@@ -1016,6 +1073,66 @@ validate_device_count() {
         echo "${C_DIM}请减小 --device-num，或扩大白名单/全局可用设备(task-submit --devices)${C_RESET}" >&2
         exit 1
     fi
+}
+
+# A grouped whitelist is a scheduling boundary independent of HCCS topology.
+# Reject impossible auto requests and explicit/sequence requests spanning pools.
+validate_allocation_pools() {
+    [[ -n "$CONF_ALLOCATION_POOLS" ]] || return 0
+    [[ "$DEVICE_STATUS_MODE" == 1 ]] && return 0
+    local request need candidates group id count max=0 matched=0 physical key index=0
+    local -a groups members requested
+    local -A joint_counts=()
+    request="$(build_device_request)"
+    need="$(device_request_count "$request")"
+    (( need > 0 )) || return 0
+    if [[ "$IGNORE_WHITELIST" == "1" ]]; then
+        echo "${C_RED}错误: 分池 DEVICE_WHITELIST 不支持 --ignore-whitelist${C_RESET}" >&2
+        exit 1
+    fi
+    IFS=';' read -ra groups <<< "$CONF_ALLOCATION_POOLS"
+    if is_auto_device_request; then
+        candidates="$(device_list_intersection "$GLOBAL_AUTO_POOL" "${DEVICE_POOL:-$GLOBAL_AUTO_POOL}")"
+        for group in "${groups[@]}"; do
+            count=0
+            IFS=',' read -ra members <<< "$group"
+            for id in "${members[@]}"; do
+                if [[ ",$candidates," == *",$id,"* ]]; then
+                    count=$((count + 1))
+                    if [[ "$CONF_GROUP_AFFINITY" == 1 && "$IGNORE_GROUP_AFFINITY" != 1 && -n "$DEVICE_GROUPS" ]]; then
+                        physical="$(device_group_of "$id")"
+                        key="${index}_${physical}"
+                        joint_counts["$key"]=$(( ${joint_counts[$key]:-0} + 1 ))
+                    fi
+                fi
+            done
+            (( count > max )) && max=$count
+            index=$((index + 1))
+        done
+        if (( ${#joint_counts[@]} > 0 )); then
+            max=0
+            for key in "${!joint_counts[@]}"; do
+                (( joint_counts[$key] > max )) && max=${joint_counts[$key]}
+            done
+        fi
+        if (( max < need )); then
+            echo "${C_RED}错误: 请求 ${need} 张卡，但分池白名单中最大的有效池只有 ${max} 张，任务无法满足${C_RESET}" >&2
+            echo "${C_DIM}分池: $CONF_ALLOCATION_POOLS（见 $DEVICE_CONF_PATH）${C_RESET}" >&2
+            exit 1
+        fi
+        return 0
+    fi
+    IFS=',' read -ra requested <<< "$request"
+    for group in "${groups[@]}"; do
+        matched=0
+        for id in "${requested[@]}"; do
+            [[ ",$group," == *",$id,"* ]] && matched=$((matched + 1))
+        done
+        (( matched == need )) && return 0
+    done
+    echo "${C_RED}错误: --device/DEVICE_SEQ 请求 [$request] 不在同一个 DEVICE_WHITELIST 分池内${C_RESET}" >&2
+    echo "${C_DIM}分池: $CONF_ALLOCATION_POOLS（见 $DEVICE_CONF_PATH）${C_RESET}" >&2
+    exit 1
 }
 
 # 同组校验：本仓 DEVICE_GROUP_AFFINITY=1 时，多卡任务的卡必须落在同一个 HCCS
@@ -1104,6 +1221,7 @@ if is_auto_device_request; then
 elif [[ -n "$LOCK_DEVICE" && "$LOCK_DEVICE" != "none" ]]; then
     DEVICE_REQUEST_ORIGIN="explicit"
 fi
+[[ "${1:-}" == "--devices" ]] && DEVICE_STATUS_MODE=1
 if [[ "${1:-}" == "--devices" ]]; then
     load_global_auto_pool 1
 else
@@ -1114,6 +1232,7 @@ apply_device_sequence
 apply_device_policy
 validate_device_pool
 validate_device_count
+validate_allocation_pools
 validate_device_group_affinity
 
 # --interactive 必须搭配 --run（需要实时终端）
@@ -1255,6 +1374,7 @@ COMMAND=$cmd
 DEVICE=$device_request
 DEVICE_AUTO=$(is_auto_device_request && echo 1 || echo 0)
 DEVICE_POOL=$DEVICE_POOL
+DEVICE_ALLOCATION_POOLS=$CONF_ALLOCATION_POOLS
 DEVICE_REQUEST_RAW=$DEVICE_REQUEST_RAW
 DEVICE_REQUEST_ORIGIN=$DEVICE_REQUEST_ORIGIN
 DEVICE_SEQUENCE_SOURCE=$DEVICE_SEQUENCE_SOURCE

@@ -31,6 +31,14 @@ daemon restart.
 
 ## Scheduler policies
 
+`DEVICE_WHITELIST="0,1,2,3;4,5,6,7"` in a repository's `task-submit.conf`
+defines logical scheduling pools. Auto multi-card requests use one pool only;
+explicit lists and `DEVICE_SEQ_N` must also fit one pool. A comma-only list
+keeps the historical flat whitelist. Do not use `--ignore-whitelist` with a
+grouped whitelist. This is separate from host `DEVICE_GROUPS`, which describes
+hardware communication domains. Check `task-submit --devices status` and the
+effective per-pool capacity when diagnosing a waiting request.
+
 Select the root-managed policy with `SCHEDULER_MODE` in
 `<root>/config/taskqueue.conf`; change it only while pending and running are
 empty, then restart the daemon.

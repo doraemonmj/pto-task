@@ -94,9 +94,70 @@ scheduler_effective_pool() {
 # need no changes and cannot bypass it.
 
 SCHEDULER_TASK_GROUP_AFFINITY=0
+SCHEDULER_TASK_ALLOCATION_POOLS=""
 SCHEDULER_GROUPS_LOADED=0
 SCHEDULER_GROUPS_LOADED_SPEC=""
 declare -A SCHEDULER_GROUP_OF=()
+SCHEDULER_POOLS_LOADED_SPEC=""
+declare -A SCHEDULER_POOL_OF=()
+
+scheduler_load_allocation_pools() {
+    local spec="${SCHEDULER_TASK_ALLOCATION_POOLS:-}" group id index=0
+    local -a groups ids
+    [[ "$spec" == "$SCHEDULER_POOLS_LOADED_SPEC" ]] && return 0
+    SCHEDULER_POOL_OF=()
+    SCHEDULER_POOLS_LOADED_SPEC="$spec"
+    [[ -n "$spec" ]] || return 0
+    IFS=';' read -ra groups <<< "$spec"
+    for group in "${groups[@]}"; do
+        IFS=',' read -ra ids <<< "$group"
+        for id in "${ids[@]}"; do SCHEDULER_POOL_OF["$id"]="$index"; done
+        index=$((index + 1))
+    done
+}
+
+scheduler_allocation_pools_valid() {
+    local spec="$1" group
+    local -a groups
+    [[ "$spec" == *';'* && "$spec" != *';' ]] || return 1
+    scheduler_device_groups_valid "$spec" || return 1
+    IFS=';' read -ra groups <<< "$spec"
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || return 1
+    done
+}
+
+SCHEDULER_ALLOCATION_KEY=""
+scheduler_set_allocation_key() {
+    local id="$1" affinity="${2:-${SCHEDULER_TASK_GROUP_AFFINITY:-0}}"
+    scheduler_set_group_key "$id"
+    SCHEDULER_ALLOCATION_KEY="$SCHEDULER_GROUP_KEY"
+    if [[ -n "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]]; then
+        scheduler_load_allocation_pools
+        [[ -n "${SCHEDULER_POOL_OF[$id]:-}" ]] || return 1
+        SCHEDULER_ALLOCATION_KEY="p${SCHEDULER_POOL_OF[$id]}"
+        if [[ "$affinity" == 1 && -n "${DEVICE_GROUPS:-}" ]]; then
+            SCHEDULER_ALLOCATION_KEY="${SCHEDULER_ALLOCATION_KEY}_${SCHEDULER_GROUP_KEY}"
+        fi
+    fi
+}
+
+scheduler_devices_same_allocation_pool() {
+    local devices="$1" id first=""
+    local -a ids
+    [[ -n "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]] || return 0
+    scheduler_load_allocation_pools
+    IFS=',' read -ra ids <<< "$devices"
+    for id in "${ids[@]}"; do
+        [[ -n "${SCHEDULER_POOL_OF[$id]:-}" ]] || return 1
+        if [[ -z "$first" ]]; then
+            first="${SCHEDULER_POOL_OF[$id]}"
+        elif [[ "${SCHEDULER_POOL_OF[$id]}" != "$first" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
 
 scheduler_device_groups_spec() {
     local spec="${DEVICE_GROUPS:-}"
@@ -216,8 +277,21 @@ scheduler_task_group_affinity() {
 }
 
 scheduler_pool_capacity() {
-    local effective
+    local effective id key max=0
+    local -a ids
+    local -A counts=()
     effective=$(scheduler_effective_pool "${1:-}")
+    if [[ -n "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]]; then
+        IFS=',' read -ra ids <<< "$effective"
+        for id in "${ids[@]}"; do
+            scheduler_set_allocation_key "$id" || continue
+            key="$SCHEDULER_ALLOCATION_KEY"
+            counts["$key"]=$(( ${counts[$key]:-0} + 1 ))
+            (( counts[$key] > max )) && max=${counts[$key]}
+        done
+        printf '%s' "$max"
+        return
+    fi
     if scheduler_group_affinity_active; then
         scheduler_max_group_size "$effective"
         return
@@ -275,8 +349,8 @@ scheduler_find_free_devices() {
         [[ -n "$id" ]] || continue
         [[ "$wrapped" == *",$id,"* ]] && continue
         any_device_in_use "$id" && continue
-        scheduler_set_group_key "$id"
-        group="$SCHEDULER_GROUP_KEY"
+        scheduler_set_allocation_key "$id" "$affinity" || continue
+        group="$SCHEDULER_ALLOCATION_KEY"
         if [[ -z "${free_in_group[$group]:-}" ]]; then
             group_order+=("$group")
             free_in_group["$group"]="$id"
@@ -301,11 +375,12 @@ scheduler_find_free_devices() {
         ranked[$pos]="$group"
     done
 
-    # Under affinity a multi-card request is satisfied from one group or not at
-    # all. The first group in rank order that covers it is the smallest one that
-    # can, which leaves the wider planes intact. Another group being partly free
-    # never leaks a cross-plane allocation; the task simply waits.
-    if [[ "$affinity" == 1 ]] && (( need > 1 )) && [[ -n "$(scheduler_device_groups_spec)" ]]; then
+    # Under either logical pool partitioning or hardware affinity, a multi-card
+    # request is satisfied from one eligible intersection or not at all. The
+    # first ranked group that covers it is the smallest one that can; partial
+    # free capacity in separate groups is never combined.
+    if (( need > 1 )) && { [[ -n "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]] ||
+        { [[ "$affinity" == 1 ]] && [[ -n "$(scheduler_device_groups_spec)" ]]; }; }; then
         for group in "${ranked[@]}"; do
             (( ${free_count[$group]} >= need )) || continue
             IFS=',' read -ra selected <<< "${free_in_group[$group]}"
@@ -337,7 +412,7 @@ scheduler_find_free_devices() {
 scheduler_start_planned_task() {
     local task_file="$1" task_id="$2" pending_request="$3"
     local pending_device_count="$4" device_pool="$5" assigned="$6"
-    local current_request current_pool current_affinity effective assigned_count
+    local current_request current_pool current_affinity current_allocation_pools effective assigned_count
     local -a assigned_ids=()
 
     if [[ "$task_file" != "$PENDING_DIR/$task_id" || "$(basename "$task_file")" != "$task_id" ||
@@ -349,8 +424,10 @@ scheduler_start_planned_task() {
     current_request=$(read_field DEVICE "$task_file" || true)
     current_pool=$(read_field DEVICE_POOL "$task_file" || true)
     current_affinity=$(scheduler_task_group_affinity "$task_file")
+    current_allocation_pools=$(read_field DEVICE_ALLOCATION_POOLS "$task_file" || true)
     if [[ "$current_request" != "$pending_request" || "$current_pool" != "$device_pool" ||
-          "$current_affinity" != "${SCHEDULER_TASK_GROUP_AFFINITY:-0}" ]]; then
+          "$current_affinity" != "${SCHEDULER_TASK_GROUP_AFFINITY:-0}" ||
+          "$current_allocation_pools" != "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]]; then
         log "scheduler reject $task_id: task device metadata changed during planning"
         return 1
     fi
@@ -411,6 +488,12 @@ scheduler_start_planned_task() {
         log "scheduler reject $task_id: allocation '$assigned' spans device groups [$(scheduler_device_groups_spec)]"
         return 1
     fi
+    if [[ -n "$assigned" && "$assigned" != none &&
+          -n "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]] &&
+       ! scheduler_devices_same_allocation_pool "$assigned"; then
+        log "scheduler reject $task_id: allocation '$assigned' spans logical whitelist pools [$SCHEDULER_TASK_ALLOCATION_POOLS]"
+        return 1
+    fi
 
     start_pending_task "$task_file" "$task_id" "$assigned" "$pending_device_count"
 }
@@ -442,6 +525,12 @@ scheduler_schedule_tick() {
         # Part of the per-task snapshot the policy sees; the core consumes it in
         # allocation and validation so policies cannot opt out of the invariant.
         SCHEDULER_TASK_GROUP_AFFINITY=$(scheduler_task_group_affinity "$task_file")
+        SCHEDULER_TASK_ALLOCATION_POOLS=$(read_field DEVICE_ALLOCATION_POOLS "$task_file" || true)
+        if [[ -n "$SCHEDULER_TASK_ALLOCATION_POOLS" ]] &&
+           ! scheduler_allocation_pools_valid "$SCHEDULER_TASK_ALLOCATION_POOLS"; then
+            log "scheduler reject $task_id: malformed logical whitelist pools"
+            continue
+        fi
 
         # This is a host admission invariant, not a policy choice. Keeping it in
         # core prevents future schedulers from accidentally bypassing the cap.
@@ -483,6 +572,7 @@ scheduler_schedule_tick() {
     done
 
     SCHEDULER_TASK_GROUP_AFFINITY=0
+    SCHEDULER_TASK_ALLOCATION_POOLS=""
 
     if declare -F scheduler_end_tick >/dev/null && ! scheduler_end_tick; then
         log "scheduler error: $SCHEDULER_MODE failed to end tick"

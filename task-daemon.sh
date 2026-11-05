@@ -509,14 +509,34 @@ run_task() {
         # affinity has to be re-established instead of inheriting whatever the
         # previous tick left in the shared snapshot variable.
         SCHEDULER_TASK_GROUP_AFFINITY=$(scheduler_task_group_affinity "$RUNNING_DIR/$task_id")
+        SCHEDULER_TASK_ALLOCATION_POOLS=$(read_field DEVICE_ALLOCATION_POOLS "$RUNNING_DIR/$task_id" || true)
         resolved_device=$(resolve_device_request "$RUNNING_DIR/$task_id" "$task_id" "$DEVICE" "$DEVICE_POOL")
         local resolve_status=$?
         SCHEDULER_TASK_GROUP_AFFINITY=0
+        SCHEDULER_TASK_ALLOCATION_POOLS=""
         if (( resolve_status != 0 )); then
             write_reject "$task_id" "error: failed to resolve device request '$DEVICE'"
             return 0
         fi
         DEVICE="$resolved_device"
+    fi
+    # Recheck the logical partition against the concrete device list at the
+    # execution boundary, including the fallback path above.
+    local allocation_pools
+    allocation_pools=$(read_field DEVICE_ALLOCATION_POOLS "$RUNNING_DIR/$task_id" || true)
+    if [[ -n "$allocation_pools" ]]; then
+        if ! scheduler_allocation_pools_valid "$allocation_pools"; then
+            write_reject "$task_id" "error: malformed DEVICE_ALLOCATION_POOLS"
+            return 0
+        fi
+        SCHEDULER_TASK_ALLOCATION_POOLS="$allocation_pools"
+        if [[ -n "$DEVICE" && "$DEVICE" != none ]] &&
+           ! scheduler_devices_same_allocation_pool "$DEVICE"; then
+            SCHEDULER_TASK_ALLOCATION_POOLS=""
+            write_reject "$task_id" "error: device allocation spans logical whitelist pools"
+            return 0
+        fi
+        SCHEDULER_TASK_ALLOCATION_POOLS=""
     fi
 
     log "exec: [$SUBMIT_USER] $COMMAND"
