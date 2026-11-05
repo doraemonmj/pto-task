@@ -509,9 +509,11 @@ run_task() {
         # affinity has to be re-established instead of inheriting whatever the
         # previous tick left in the shared snapshot variable.
         SCHEDULER_TASK_GROUP_AFFINITY=$(scheduler_task_group_affinity "$RUNNING_DIR/$task_id")
+        SCHEDULER_TASK_ALLOCATION_POOLS=$(read_field DEVICE_ALLOCATION_POOLS "$RUNNING_DIR/$task_id" || true)
         resolved_device=$(resolve_device_request "$RUNNING_DIR/$task_id" "$task_id" "$DEVICE" "$DEVICE_POOL")
         local resolve_status=$?
         SCHEDULER_TASK_GROUP_AFFINITY=0
+        SCHEDULER_TASK_ALLOCATION_POOLS=""
         if (( resolve_status != 0 )); then
             write_reject "$task_id" "error: failed to resolve device request '$DEVICE'"
             return 0

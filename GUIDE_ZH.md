@@ -210,6 +210,21 @@ task-submit --find "<子串>"          # 按完整命令匹配，只输出 task-
 找到的 `task-submit.conf`。输出还会计算 daemon 最终可分配的 auto 候选集合，并
 提示空交集、被全局池排除的卡和固定 `DEVICE_SEQ_N` 超出全局池等兼容行为。
 
+### 项目逻辑分池
+
+只需在项目的 `task-submit.conf` 中把 `DEVICE_WHITELIST` 写成分号分池形式：
+
+```bash
+DEVICE_WHITELIST="0,1,2,3;4,5,6,7"
+```
+
+`task-submit --device auto --device-num 4` 会选择任一有四张空闲卡的池；两池
+各空两张时继续排队，不跨池凑卡。若各池与全局卡池、项目黑名单取交集后都少于四张，
+提交时直接报错。显式 `--device` 和 `DEVICE_SEQ_4` 也必须完全落在同一池；
+分池格式不能用 `--ignore-whitelist` 绕过。逗号列表（无分号）的旧行为不变。
+此规则只约束调度，独立于下面描述硬件通信域的 `DEVICE_GROUPS`；若两者同时启用，
+分配结果必须同时满足两种约束。用 `task-submit --devices status` 查看各池有效候选。
+
 ### 同 HCCS plane 借卡（卡组）
 
 有些服务器的卡分属不同的 HCCS plane（通信域），跨 plane 的多卡通信在

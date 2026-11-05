@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+fail() { echo "error: $*" >&2; exit 1; }
+assert_eq() { [[ "$1" == "$2" ]] || fail "$3: expected '$1', got '$2'"; }
+
+# Exercise the scheduler without starting a daemon or touching device state.
+source "$REPO_DIR/schedulers/_core.sh"
+AVAILABLE_DEVICES="0,1,2,3,4,5,6,7"
+DEVICE_GROUPS=""
+SCHEDULER_TASK_ALLOCATION_POOLS="0,1,2,3;4,5,6,7"
+SCHEDULER_TASK_GROUP_AFFINITY=0
+IN_USE=""
+scheduler_effective_pool() { printf '%s' "${1:-$AVAILABLE_DEVICES}"; }
+any_device_in_use() { [[ ",$IN_USE," == *",$1,"* ]]; }
+device_request_count() { local -a ids; IFS=',' read -ra ids <<< "$1"; printf '%s' "${#ids[@]}"; }
+
+IN_USE="0,1"
+assert_eq "4,5,6,7" "$(scheduler_find_free_devices 4 '' '')" "back pool selected"
+IN_USE="0,4"
+scheduler_find_free_devices 4 '' '' >/dev/null && fail "combined two partial pools"
+assert_eq "4" "$(scheduler_pool_capacity '')" "capacity is one pool, not both"
+IN_USE="0"
+assert_eq "1" "$(scheduler_find_free_devices 1 '' '')" "single-card task uses fragmented pool"
+scheduler_devices_same_allocation_pool "0,3" || fail "rejected same-pool explicit request"
+scheduler_devices_same_allocation_pool "0,4" && fail "accepted cross-pool explicit request"
+
+PENDING_DIR="$TEST_ROOT/pending"
+mkdir -p "$PENDING_DIR"
+MAX_CONCURRENT=4
+CURRENT_JOBS=0
+MAX_CONCURRENT_8_CARD_TASKS=0
+RUNNING_8_CARD_TASKS=0
+STARTED=""
+read_field() { sed -n "s/^$1=//p" "$2" | head -1; }
+log() { :; }
+start_pending_task() { STARTED="$3"; }
+cat > "$PENDING_DIR/task_1" <<'EOF'
+DEVICE=auto:4
+DEVICE_POOL=0,1,2,3,4,5,6,7
+DEVICE_ALLOCATION_POOLS=0,1,2,3;4,5,6,7
+DEVICE_GROUP_AFFINITY=0
+EOF
+IN_USE=""
+if scheduler_start_planned_task "$PENDING_DIR/task_1" task_1 auto:4 4 \
+    0,1,2,3,4,5,6,7 0,1,4,5; then fail "claim-time check allowed cross-pool allocation"; fi
+assert_eq "" "$STARTED" "cross-pool plan did not start"
+scheduler_start_planned_task "$PENDING_DIR/task_1" task_1 auto:4 4 \
+    0,1,2,3,4,5,6,7 4,5,6,7
+assert_eq "4,5,6,7" "$STARTED" "same-pool plan started"
+
+# Intersect logical pools with hardware affinity when both are present.
+DEVICE_GROUPS="0,1;2,3;4,5,6,7"
+SCHEDULER_TASK_GROUP_AFFINITY=1
+IN_USE=""
+assert_eq "4,5,6,7" "$(scheduler_find_free_devices 4 '' '')" "physical and logical constraints intersect"
+
+# Exercise submission parsing and permanent-capacity rejection.
+mkdir -p "$TEST_ROOT"/{config,project,state/{pending,running,done,locks,kill,fifo},logs}
+cat > "$TEST_ROOT/config/taskqueue.conf" <<EOF
+STATE_DIR="$TEST_ROOT/state"
+LOGS_DIR="$TEST_ROOT/logs"
+AVAILABLE_DEVICES="0,1,2,3,4,5,6,7"
+MAX_CONCURRENT=4
+EOF
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST="0,1,2,3;4,5,6,7"
+EOF
+submit() { (cd "$TEST_ROOT/project" && TASKQUEUE_CONF="$TEST_ROOT/config/taskqueue.conf" "$REPO_DIR/task-submit.sh" "$@"); }
+task_id=$(submit --device auto --device-num 4 'echo hello')
+task_file="$TEST_ROOT/state/pending/$task_id"
+grep -Fxq 'DEVICE_POOL=0,1,2,3,4,5,6,7' "$task_file" || fail "flattened candidate pool missing"
+grep -Fxq 'DEVICE_ALLOCATION_POOLS=0,1,2,3;4,5,6,7' "$task_file" || fail "logical pools missing"
+explicit_id=$(submit --device 0,1 'echo explicit')
+grep -Fxq 'DEVICE=0,1' "$TEST_ROOT/state/pending/$explicit_id" || fail "same-pool explicit request was not accepted"
+status=$(submit --devices status)
+grep -Fq '分池单次上限 4 张' <<< "$status" || fail "status did not show per-pool capacity"
+[[ "$status" != *INVALID* ]] || fail "valid grouped whitelist was marked invalid"
+if submit --device 0,4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted cross-pool explicit request"; fi
+grep -Fq '不在同一个 DEVICE_WHITELIST 分池' "$TEST_ROOT/out" || fail "missing cross-pool error"
+if submit --ignore-whitelist --device auto --device-num 4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "override bypassed pools"; fi
+grep -Fq '不支持 --ignore-whitelist' "$TEST_ROOT/out" || fail "missing override error"
+cat >> "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_SEQ_4=0,1,4,5
+EOF
+if submit --device auto --device-num 4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted cross-pool fixed sequence"; fi
+grep -Fq '不在同一个 DEVICE_WHITELIST 分池' "$TEST_ROOT/out" || fail "missing sequence error"
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST="0,1,2,3;4,5,6,7"
+DEVICE_SEQ_4=4,5,6,7
+EOF
+same_pool_id=$(submit --device auto --device-num 4 'echo same-pool')
+grep -Fxq 'DEVICE=4,5,6,7' "$TEST_ROOT/state/pending/$same_pool_id" || fail "same-pool sequence was not accepted"
+
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST="0,1,2,3;4,5,6,7"
+DEVICE_BLACKLIST=0,4
+EOF
+if submit --device auto --device-num 4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted impossible request"; fi
+grep -Fq '最大的有效池只有 3 张' "$TEST_ROOT/out" || fail "missing capacity error"
+
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST="0,1,2,3;"
+EOF
+if submit --device auto --device-num 2 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted trailing empty pool"; fi
+grep -Fq '分池格式无效' "$TEST_ROOT/out" || fail "missing malformed-pool error"
+
+cat >> "$TEST_ROOT/config/taskqueue.conf" <<'EOF'
+DEVICE_GROUPS="0,1;2,3;4,5;6,7"
+EOF
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST="0,1,2,3;4,5,6,7"
+DEVICE_GROUP_AFFINITY=1
+EOF
+if submit --device auto --device-num 4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted impossible logical/physical intersection"; fi
+grep -Fq '最大的有效池只有 2 张' "$TEST_ROOT/out" || fail "missing intersection capacity error"
+
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST=0,1,2,3,4,5,6,7
+EOF
+legacy_id=$(submit --device auto --device-num 4 'echo legacy')
+grep -Fxq 'DEVICE_ALLOCATION_POOLS=' "$TEST_ROOT/state/pending/$legacy_id" || fail "legacy format enabled grouping"
+echo 'whitelist pool tests passed'
