@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect PTO Task usage every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=pto-task-usage-report-collect.service
+
+[Install]
+WantedBy=timers.target

@@ -109,6 +109,16 @@ independent of the daemon and disabled by default. Set
 rerun `sudo bash setup.sh` to install and enable its timer. The task daemon does
 not need a restart.
 
+For archived daily server usage, use `task-submit --usage status` and
+`sudo task-submit --usage day --date YYYY-MM-DD`. The archive is administrator
+only because it contains user sessions. `USAGE_REPORT_ENABLED` defaults to
+false. When configuring a server, **ask the user whether to enable this
+collector and Feishu publisher before setting it to true or activating its
+timers**. An install or update request alone does not answer that question.
+`USAGE_SERVER_LABEL` controls the Feishu display name (for example, `686`).
+See the README's archived server usage section for other settings. Do not
+present login duration as active working time.
+
 Start the daemon only when explicitly requested. `deploy.sh` is the explicit
 one-command install/update-and-activate entry point; `setup.sh` intentionally
 does not start or restart the daemon. Starting it requires root; normal
