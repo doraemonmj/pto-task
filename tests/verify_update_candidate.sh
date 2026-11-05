@@ -14,6 +14,7 @@ bash tests/test_scheduler_core.sh
 bash tests/test_pool_aware_reservation.sh
 bash tests/test_device_group_affinity.sh
 bash tests/test_eight_card_limit.sh
+bash tests/test_queue_timeout.sh
 bash tests/test_auto_update_retry.sh
 bash tests/test_deploy_upgrade_guard.sh
 bash tests/test_repo_auto_update_adapter.sh

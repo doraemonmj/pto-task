@@ -116,9 +116,11 @@ access. `PTOAS_ROOT`, `ASCEND_HOME_PATH`, `GCC15_ROOT`, `CLANG_FORMAT`, and
 `MODELS_ROOT` are supported; `GCC15_ROOT` is optional and unset by default.
 Legacy root-owned `/etc/pypto-env.conf` is imported on first install when safe.
 
-`--max-time` defaults to 300 seconds; `--timeout` defaults to 600 seconds and
-only controls client waiting. Project-local `task-submit.conf` device policies
-and the existing `TASKQUEUE_DEVICE_*` environment controls continue to work.
+`--max-time` defaults to 300 seconds and limits execution after the task starts.
+`--timeout` defaults to 600 seconds and limits only the pending queue wait;
+once the task starts, the client waits for the daemon's result. Project-local
+`task-submit.conf` device policies and the existing `TASKQUEUE_DEVICE_*`
+environment controls continue to work.
 `task-submit --devices status` reports every auto-pool source, the discovered
 project policy, the effective intersection used by the daemon, and conflicts
 such as fixed sequences outside the global auto pool. Malformed lists,

@@ -158,7 +158,7 @@ task-submit --run "pytest tests/test_foo.py"
 # 长训练（默认 300 秒会被 kill，必须加 --max-time 0）
 task-submit --device auto --max-time 0 --run "python train.py"
 
-# 一直等到任务结束（--timeout 0 = 客户端不超时）
+# 排队和执行都不限时
 task-submit --device auto --max-time 0 --timeout 0 --run "python train.py"
 
 # 交互式任务（执行过程中可以从终端输入）
@@ -261,10 +261,11 @@ task-submit --clean --days 7        # 清理 7 天前完成的任务
 | 参数 | 作用 | 默认 | `0` 的含义 |
 |---|---|---|---|
 | `--max-time N` | 服务端的任务最大运行时间，超时被 kill | `300` 秒 | 不限时 |
-| `--timeout N` | 客户端等待时间 | `600` 秒 | 一直等 |
+| `--timeout N` | 客户端排队等待上限；任务开始运行后停止计时 | `600` 秒 | 排队不限时 |
 
-`--timeout` 只是断开等待，**任务仍在运行**，可以用
-`task-submit --wait <task-id>` 重新连上。
+排队超过 `--timeout` 时，客户端取消仍在排队的任务并返回失败；任务已经进入
+running 后，客户端一直等待结果，实际执行时长由 daemon 的 `--max-time` 限制。
+`--max-time 0` 会取消执行上限，此时客户端也会一直等到任务结束。
 
 ## 注意事项
 

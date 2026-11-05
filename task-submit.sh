@@ -5,7 +5,7 @@
 #   task-submit --run "command"                     提交并等待完成（一步到位）
 #   task-submit --device 0 "command"                提交并自动锁 NPU 设备
 #   task-submit --wait <task-id>                    等待任务完成并输出结果
-#   task-submit --timeout 600 --wait <task-id>      自定义超时
+#   task-submit --timeout 600 --wait <task-id>      自定义排队超时
 #   task-submit --status <task-id>                  查看任务状态
 #   task-submit --log <task-id>                     查看任务日志
 #   task-submit --cancel <task-id>                  取消 pending 任务
@@ -161,7 +161,7 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
 查询:
   task-submit --version                        显示已安装源码 revision
   task-submit --wait <task-id>                 等待任务完成并实时输出日志
-  task-submit --timeout N --wait <task-id>     自定义等待超时(秒，默认 600)
+  task-submit --timeout N --wait <task-id>     自定义排队超时(秒，默认 600)
   task-submit --status <task-id>               查看任务状态
   task-submit --log <task-id>                  查看任务日志（已完成或运行中）
   task-submit --stats [--days N]               查看 NPU 使用统计（默认近 7 天）
@@ -181,7 +181,7 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
 选项:
   --no-device     不分配 NPU 卡（默认行为，写出来更明确）。与 --device-num 同用会报错；
                   也别和 --device 混写（后写的生效）
-  --timeout N     设置等待超时(秒)，可放在任意子命令前
+  --timeout N     设置排队等待超时(秒)，任务运行后不再计时；0=一直等
   --device auto   自动分配空闲 NPU 卡（需要 NPU 时必须指定）
   --device-num N  自动分配 N 张空闲 NPU 卡（需配合 --device auto，或单独使用）
                   若每仓 task-submit.conf 配了 DEVICE_SEQ_<N>，则改为固定使用该卡号
@@ -1432,22 +1432,26 @@ wait_task() {
     trap '_sig_exit=130; _wait_cleanup' INT
     trap '_sig_exit=143; _wait_cleanup' TERM HUP
 
-    # 等待超时：客户端就此退出，任务必须一并了结，否则会变成无主僵尸继续排队 ——
+    # 排队超时：客户端就此退出，任务必须一并了结，否则会变成无主僵尸继续排队 ——
     # 它可能在几十分钟后突然被调度，独占整机的卡去跑一个早已无人认领的结果。
     # （2026-07-14：两个 auto:8 的 CI 任务超时后又排了 47 分钟，随后自行启动并抢走全部 8 张卡。）
-    # 仍在 pending 则取消；已经 running 则交给 daemon 的 max-time watchdog，不在此强杀，
-    # 以免破坏 “断开后可用 --wait 重连” 的语义。
-    _wait_timeout() {
-        [[ -n "$stdin_fwd_pid" ]] && kill "$stdin_fwd_pid" 2>/dev/null && wait "$stdin_fwd_pid" 2>/dev/null
-        [[ -n "$tail_pid" ]] && kill "$tail_pid" 2>/dev/null && wait "$tail_pid" 2>/dev/null
-        echo "${C_RED}错误: 等待超时 (${TIMEOUT}s)${C_RESET}" >&2
-        if [[ -f "$PENDING_DIR/$task_id" ]]; then
-            rm -f "$PENDING_DIR/$task_id" "$PENDING_DIR/${task_id}.env"
-            echo "${C_YELLOW}已取消仍在排队的任务: $task_id（超时前未分配到设备）${C_RESET}" >&2
-        elif [[ -f "$RUNNING_DIR/$task_id" ]]; then
-            echo "${C_YELLOW}任务仍在运行，将由 daemon 在 --max-time 到期后终止${C_RESET}" >&2
-            echo "${C_DIM}重连: task-submit --wait $task_id    立即终止: task-submit --kill $task_id${C_RESET}" >&2
+    # daemon 可能在检查截止时间与删除 pending 文件之间完成认领；这种情况下
+    # 继续等待执行结果，不把运行中的任务误报为排队超时。
+    _wait_queue_timeout() {
+        if [[ -f "$RUNNING_DIR/$task_id" || -f "$DONE_DIR/$task_id" ]]; then
+            return 0
         fi
+        if ! rm -f "$PENDING_DIR/$task_id"; then
+            echo "${C_RED}错误: 排队超时，但无法取消任务: $task_id${C_RESET}" >&2
+            trap - INT TERM HUP
+            exit 1
+        fi
+        if [[ -f "$RUNNING_DIR/$task_id" || -f "$DONE_DIR/$task_id" ]]; then
+            return 0
+        fi
+        rm -f "$PENDING_DIR/${task_id}.env"
+        echo "${C_RED}错误: 排队等待超时 (${TIMEOUT}s)${C_RESET}" >&2
+        echo "${C_YELLOW}已取消仍在排队的任务: $task_id（超时前未分配到设备）${C_RESET}" >&2
         trap - INT TERM HUP
         exit 1
     }
@@ -1463,18 +1467,22 @@ wait_task() {
     fi
 
     echo "${C_DIM}等待任务执行: $task_id (Ctrl+C 终止任务)${C_RESET}" >&2
-    while [[ ! -f "$log_file" ]] && [[ $TIMEOUT -eq 0 || $elapsed_ms -lt $timeout_ms ]]; do
+    while [[ ! -f "$log_file" && ! -f "$DONE_DIR/$task_id" ]]; do
+        if [[ ! -f "$PENDING_DIR/$task_id" && ! -f "$RUNNING_DIR/$task_id" &&
+              ! -f "$DONE_DIR/$task_id" ]]; then
+            echo "${C_RED}错误: 任务不存在或已取消: $task_id${C_RESET}" >&2
+            trap - INT TERM HUP
+            exit 1
+        fi
+        if [[ -f "$PENDING_DIR/$task_id" && "$TIMEOUT" -ne 0 &&
+              "$elapsed_ms" -ge "$timeout_ms" ]]; then
+            _wait_queue_timeout
+        fi
         sleep 0.2
-        elapsed_ms=$((elapsed_ms + 200))
-        # 也可能在等待中就完成了
-        if [[ -f "$DONE_DIR/$task_id" ]]; then
-            break
+        if [[ -f "$PENDING_DIR/$task_id" ]]; then
+            elapsed_ms=$((elapsed_ms + 200))
         fi
     done
-
-    if [[ ! -f "$log_file" ]] && [[ $TIMEOUT -ne 0 && $elapsed_ms -ge $timeout_ms ]]; then
-        _wait_timeout
-    fi
 
     # 实时跟踪日志。必须 -n +1：tail 默认只从最后 10 行开始跟随，而 tail 挂上来之前
     # 任务往往已经输出了几十行（8 卡任务光 npu-lock 就有 16 行），开头会被静默吞掉 ——
@@ -1499,9 +1507,8 @@ wait_task() {
             done
         fi
     else
-        while [[ ! -f "$DONE_DIR/$task_id" ]] && [[ $TIMEOUT -eq 0 || $elapsed_ms -lt $timeout_ms ]]; do
+        while [[ ! -f "$DONE_DIR/$task_id" ]]; do
             sleep 0.2
-            elapsed_ms=$((elapsed_ms + 200))
         done
     fi
 
@@ -1524,7 +1531,8 @@ wait_task() {
         trap - INT TERM HUP
         exit "${exit_code:-1}"
     else
-        _wait_timeout
+        echo "${C_RED}错误: 等待任务结果中断: $task_id${C_RESET}" >&2
+        exit 1
     fi
 }
 
