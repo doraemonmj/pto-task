@@ -15,8 +15,24 @@ SCHEDULER_TASK_ALLOCATION_POOLS="0,1,2,3;4,5,6,7"
 SCHEDULER_TASK_GROUP_AFFINITY=0
 IN_USE=""
 scheduler_effective_pool() { printf '%s' "${1:-$AVAILABLE_DEVICES}"; }
-any_device_in_use() { [[ ",$IN_USE," == *",$1,"* ]]; }
-device_request_count() { local -a ids; IFS=',' read -ra ids <<< "$1"; printf '%s' "${#ids[@]}"; }
+any_device_in_use() {
+    local id
+    local -a ids
+    IFS=',' read -ra ids <<< "$1"
+    for id in "${ids[@]}"; do
+        [[ ",$IN_USE," == *",$id,"* ]] && return 0
+    done
+    return 1
+}
+device_request_count() {
+    local -a ids
+    case "$1" in
+        auto) printf 1 ;;
+        auto:*) printf '%s' "${1#auto:}" ;;
+        ""|none) printf 0 ;;
+        *) IFS=',' read -ra ids <<< "$1"; printf '%s' "${#ids[@]}" ;;
+    esac
+}
 
 IN_USE="0,1"
 assert_eq "4,5,6,7" "$(scheduler_find_free_devices 4 '' '')" "back pool selected"
@@ -51,6 +67,36 @@ assert_eq "" "$STARTED" "cross-pool plan did not start"
 scheduler_start_planned_task "$PENDING_DIR/task_1" task_1 auto:4 4 \
     0,1,2,3,4,5,6,7 4,5,6,7
 assert_eq "4,5,6,7" "$STARTED" "same-pool plan started"
+
+# Exercise the actual backfill queue walk: a blocked large task must not block
+# a younger small task, while an available whole pool must satisfy the large one.
+source "$REPO_DIR/schedulers/backfill.sh"
+SCHEDULER_MODE=backfill
+resolve_device_request() {
+    scheduler_find_free_devices "$(device_request_count "$3")" "$4" ""
+}
+start_pending_task() {
+    STARTED="${STARTED}${2}:${3};"
+    CURRENT_JOBS=$((CURRENT_JOBS + 1))
+    IN_USE="${IN_USE:+$IN_USE,}${3}"
+}
+cat > "$PENDING_DIR/task_2" <<'EOF'
+DEVICE=auto:2
+DEVICE_POOL=0,1,2,3,4,5,6,7
+DEVICE_ALLOCATION_POOLS=0,1,2,3;4,5,6,7
+DEVICE_GROUP_AFFINITY=0
+EOF
+IN_USE="0,4"
+STARTED=""
+scheduler_schedule_tick
+assert_eq "task_2:1,2;" "$STARTED" "backfill starts small task while both pools are partial"
+
+IN_USE="0,1"
+CURRENT_JOBS=0
+STARTED=""
+scheduler_schedule_tick
+assert_eq "task_1:4,5,6,7;task_2:2,3;" "$STARTED" \
+    "backfill starts large task in the available pool, then small task in the other"
 
 # Intersect logical pools with hardware affinity when both are present.
 DEVICE_GROUPS="0,1;2,3;4,5,6,7"
