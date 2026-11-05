@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.request
+from zoneinfo import ZoneInfo
 
 
 ISO = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d')
@@ -34,6 +35,19 @@ def config_value(path, key, default=''):
 
 def ts(value):
     return datetime.fromisoformat(value).timestamp() if value else None
+
+
+def report_timezone(config):
+    name = config_value(config, 'USAGE_TIMEZONE')
+    if not name:
+        localtime = Path('/etc/localtime')
+        target = str(localtime.resolve()) if localtime.exists() else ''
+        marker = '/zoneinfo/'
+        if marker in target:
+            name = target.split(marker, 1)[1]
+    if not name:
+        name = 'UTC'
+    return ZoneInfo(name)
 
 
 def database(path):
@@ -186,7 +200,10 @@ class Feishu:
         return result.get('data', result)
 
     def create(self, title):
-        return self.call('POST', '/docx/v1/documents', {'title': title})['document']['document_id']
+        doc = self.call('POST', '/docx/v1/documents', {'title': title})['document']['document_id']
+        self.call('PATCH', f'/drive/v2/permissions/{doc}/public?type=docx',
+                  {'link_share_entity': 'tenant_readable'})
+        return doc
 
     def content(self, doc):
         return self.call('GET', f'/docx/v1/documents/{doc}/raw_content')['content']
@@ -312,7 +329,7 @@ def main():
         raise SystemExit('usage collection is disabled (USAGE_REPORT_ENABLED=false)')
     if args.command == 'day' and not args.db.exists():
         raise SystemExit('no usage data collected yet')
-    tz = datetime.now().astimezone().tzinfo
+    tz = report_timezone(args.config)
     db = database(args.db)
     if args.command in ('collect', 'publish'):
         state_dir = args.state_dir or ROOT / 'state'

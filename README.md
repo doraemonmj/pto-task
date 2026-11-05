@@ -260,6 +260,7 @@ before setting `USAGE_REPORT_ENABLED=true` in `config/taskqueue.conf`:
 ```bash
 USAGE_REPORT_ENABLED=true
 USAGE_SERVER_LABEL="686"
+USAGE_TIMEZONE="Asia/Shanghai" # 按服务器实际时区填写；本机为 America/Los_Angeles
 USAGE_FEISHU_CONFIG="/home/pypto-tools/pto-simpler-perf-tracker/config/perf-tracker.env"
 USAGE_INDEX_DOCX_TOKEN=""  # other servers use the first server's index ID
 USAGE_HUB_STATE_FILE="/home/pypto-tools/pto-simpler-perf-tracker/state/usage-index.json" # hub server only
@@ -268,6 +269,7 @@ USAGE_HUB_STATE_FILE="/home/pypto-tools/pto-simpler-perf-tracker/state/usage-ind
 Run `sudo bash setup.sh` to install/enable the hourly collector and daily
 publisher timers; the daemon needs no restart. The publisher creates a usage
 index, one index per server, and weekly documents containing multiple days.
+New documents are readable by members of the Feishu tenant who have the link.
 It updates a date on retry and catches up after downtime. Credentials remain
 in the 0600 Feishu config. The hub server writes a document ID to
 `usage-index.json`, read by the performance tracker's report hub. Deploy a

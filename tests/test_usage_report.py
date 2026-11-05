@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 
 module_path = Path(__file__).resolve().parents[1] / 'usage_report.py'
@@ -14,6 +15,18 @@ spec.loader.exec_module(usage)
 
 
 class UsageReportTest(unittest.TestCase):
+    def test_dst_day_uses_local_calendar_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = usage.database(Path(temp) / 'usage.sqlite3')
+            db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?)',
+                       ('task_dst', 'alice', usage.ts('2026-11-01T07:00:00+00:00'),
+                        usage.ts('2026-11-02T08:00:00+00:00'), '0', 0))
+            db.commit()
+            row = usage.day_report(db, '2026-11-01', '686',
+                                   ZoneInfo('America/Los_Angeles'))['users']['alice']
+            self.assertEqual(row['task_hours'], 25)
+            self.assertEqual(row['card_hours'], 25)
+
     def test_cross_midnight_multicard_and_overlapping_sessions(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
