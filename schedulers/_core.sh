@@ -116,6 +116,17 @@ scheduler_load_allocation_pools() {
     done
 }
 
+scheduler_allocation_pools_valid() {
+    local spec="$1" group
+    local -a groups
+    [[ "$spec" == *';'* && "$spec" != *';' ]] || return 1
+    scheduler_device_groups_valid "$spec" || return 1
+    IFS=';' read -ra groups <<< "$spec"
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || return 1
+    done
+}
+
 SCHEDULER_ALLOCATION_KEY=""
 scheduler_set_allocation_key() {
     local id="$1" affinity="${2:-${SCHEDULER_TASK_GROUP_AFFINITY:-0}}"
@@ -125,7 +136,7 @@ scheduler_set_allocation_key() {
         scheduler_load_allocation_pools
         [[ -n "${SCHEDULER_POOL_OF[$id]:-}" ]] || return 1
         SCHEDULER_ALLOCATION_KEY="p${SCHEDULER_POOL_OF[$id]}"
-        if [[ "$affinity" == 1 && -n "$(scheduler_device_groups_spec)" ]]; then
+        if [[ "$affinity" == 1 && -n "${DEVICE_GROUPS:-}" ]]; then
             SCHEDULER_ALLOCATION_KEY="${SCHEDULER_ALLOCATION_KEY}_${SCHEDULER_GROUP_KEY}"
         fi
     fi
@@ -515,9 +526,8 @@ scheduler_schedule_tick() {
         # allocation and validation so policies cannot opt out of the invariant.
         SCHEDULER_TASK_GROUP_AFFINITY=$(scheduler_task_group_affinity "$task_file")
         SCHEDULER_TASK_ALLOCATION_POOLS=$(read_field DEVICE_ALLOCATION_POOLS "$task_file" || true)
-        if [[ "$SCHEDULER_TASK_ALLOCATION_POOLS" == *';' ]] ||
-           { [[ -n "$SCHEDULER_TASK_ALLOCATION_POOLS" ]] &&
-             ! scheduler_device_groups_valid "$SCHEDULER_TASK_ALLOCATION_POOLS"; }; then
+        if [[ -n "$SCHEDULER_TASK_ALLOCATION_POOLS" ]] &&
+           ! scheduler_allocation_pools_valid "$SCHEDULER_TASK_ALLOCATION_POOLS"; then
             log "scheduler reject $task_id: malformed logical whitelist pools"
             continue
         fi

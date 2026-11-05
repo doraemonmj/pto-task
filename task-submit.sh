@@ -103,6 +103,7 @@ GROUP_AFFINITY_EFFECTIVE=0
 declare -A DEVICE_GROUP_OF=()
 DEVICE_GROUP_MAP_LOADED=0
 CONF_ALLOCATION_POOLS=""
+DEVICE_STATUS_MODE=0
 # 关闭同组约束：供确实需要跨 plane 的负载（如 torch_npu 纯 HCCL collective 加
 # RoCE）放行。触发：--ignore-group-affinity 或 TASKQUEUE_IGNORE_GROUP_AFFINITY=1。
 IGNORE_GROUP_AFFINITY=0
@@ -558,13 +559,16 @@ load_device_conf() {
     CONF_BLACKLIST_RAW="$(read_conf_field DEVICE_BLACKLIST "$conf")"
     CONF_WHITELIST="$CONF_WHITELIST_RAW"
     if [[ "$CONF_WHITELIST_RAW" == *';'* ]]; then
-        if [[ "$CONF_WHITELIST_RAW" == *';' ]] || ! device_groups_valid "$CONF_WHITELIST_RAW"; then
-            echo "${C_RED}错误: $conf 中 DEVICE_WHITELIST 分池格式无效: '$CONF_WHITELIST_RAW'${C_RESET}" >&2
-            echo "${C_DIM}应为不重叠的分号分池、池内逗号分卡，如 DEVICE_WHITELIST=\"0,1,2,3;4,5,6,7\"${C_RESET}" >&2
-            exit 1
+        if ! allocation_pools_valid "$CONF_WHITELIST_RAW"; then
+            if [[ "$DEVICE_STATUS_MODE" != 1 ]]; then
+                echo "${C_RED}错误: $conf 中 DEVICE_WHITELIST 分池格式无效: '$CONF_WHITELIST_RAW'${C_RESET}" >&2
+                echo "${C_DIM}应为不重叠的分号分池、池内逗号分卡，如 DEVICE_WHITELIST=\"0,1,2,3;4,5,6,7\"；卡号不能带前导零${C_RESET}" >&2
+                exit 1
+            fi
+        else
+            CONF_ALLOCATION_POOLS="$CONF_WHITELIST_RAW"
+            CONF_WHITELIST="${CONF_WHITELIST_RAW//;/,}"
         fi
-        CONF_ALLOCATION_POOLS="$CONF_WHITELIST_RAW"
-        CONF_WHITELIST="${CONF_WHITELIST_RAW//;/,}"
     fi
     CONF_BLACKLIST="$CONF_BLACKLIST_RAW"
     CONF_GROUP_AFFINITY_RAW="$(read_conf_field DEVICE_GROUP_AFFINITY "$conf")"
@@ -596,6 +600,17 @@ device_groups_valid() {
         done
     done
     return 0
+}
+
+allocation_pools_valid() {
+    local spec="$1" group
+    local -a groups
+    [[ "$spec" == *';'* && "$spec" != *';' ]] || return 1
+    device_groups_valid "$spec" || return 1
+    IFS=';' read -ra groups <<< "$spec"
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || return 1
+    done
 }
 
 load_device_group_map() {
@@ -757,7 +772,12 @@ show_device_policy_sources() {
             fi
         else
             echo "    DEVICE_WHITELIST=$(format_device_pool "$CONF_WHITELIST_RAW")"
-            show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+            if [[ "$CONF_WHITELIST_RAW" == *';'* ]]; then
+                echo "      ${C_RED}INVALID${C_RESET}: DEVICE_WHITELIST 分池格式无效（分号分池、卡号不得重复或带前导零）"
+                whitelist_valid=0
+            else
+                show_device_list_health "      " "DEVICE_WHITELIST" "$CONF_WHITELIST_RAW" || whitelist_valid=0
+            fi
         fi
         echo "    DEVICE_BLACKLIST=$(format_device_pool "$CONF_BLACKLIST_RAW")"
         show_device_list_health "      " "DEVICE_BLACKLIST" "$CONF_BLACKLIST_RAW" || blacklist_valid=0
@@ -1057,16 +1077,17 @@ validate_device_count() {
 # Reject impossible auto requests and explicit/sequence requests spanning pools.
 validate_allocation_pools() {
     [[ -n "$CONF_ALLOCATION_POOLS" ]] || return 0
-    if [[ "$IGNORE_WHITELIST" == "1" ]]; then
-        echo "${C_RED}错误: 分池 DEVICE_WHITELIST 不支持 --ignore-whitelist${C_RESET}" >&2
-        exit 1
-    fi
+    [[ "$DEVICE_STATUS_MODE" == 1 ]] && return 0
     local request need candidates group id count max=0 matched=0 physical key index=0
     local -a groups members requested
     local -A joint_counts=()
     request="$(build_device_request)"
     need="$(device_request_count "$request")"
     (( need > 0 )) || return 0
+    if [[ "$IGNORE_WHITELIST" == "1" ]]; then
+        echo "${C_RED}错误: 分池 DEVICE_WHITELIST 不支持 --ignore-whitelist${C_RESET}" >&2
+        exit 1
+    fi
     IFS=';' read -ra groups <<< "$CONF_ALLOCATION_POOLS"
     if is_auto_device_request; then
         candidates="$(device_list_intersection "$GLOBAL_AUTO_POOL" "${DEVICE_POOL:-$GLOBAL_AUTO_POOL}")"
@@ -1198,6 +1219,7 @@ if is_auto_device_request; then
 elif [[ -n "$LOCK_DEVICE" && "$LOCK_DEVICE" != "none" ]]; then
     DEVICE_REQUEST_ORIGIN="explicit"
 fi
+[[ "${1:-}" == "--devices" ]] && DEVICE_STATUS_MODE=1
 if [[ "${1:-}" == "--devices" ]]; then
     load_global_auto_pool 1
 else

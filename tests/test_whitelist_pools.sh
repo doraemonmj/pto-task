@@ -79,10 +79,14 @@ grep -Fxq 'DEVICE=0,1' "$TEST_ROOT/state/pending/$explicit_id" || fail "same-poo
 status=$(submit --devices status)
 grep -Fq '分池单次上限 4 张' <<< "$status" || fail "status did not show per-pool capacity"
 [[ "$status" != *INVALID* ]] || fail "valid grouped whitelist was marked invalid"
+ignored_status=$(submit --ignore-whitelist --devices status)
+grep -Fq 'INVALID: 分池白名单不可使用 --ignore-whitelist' <<< "$ignored_status" || fail "status hid incompatible override"
 if submit --device 0,4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted cross-pool explicit request"; fi
 grep -Fq '不在同一个 DEVICE_WHITELIST 分池' "$TEST_ROOT/out" || fail "missing cross-pool error"
 if submit --ignore-whitelist --device auto --device-num 4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "override bypassed pools"; fi
 grep -Fq '不支持 --ignore-whitelist' "$TEST_ROOT/out" || fail "missing override error"
+cpu_id=$(submit --ignore-whitelist 'echo cpu-only')
+grep -Fxq 'DEVICE=' "$TEST_ROOT/state/pending/$cpu_id" || fail "device-free task was blocked by grouping"
 cat >> "$TEST_ROOT/project/task-submit.conf" <<'EOF'
 DEVICE_SEQ_4=0,1,4,5
 EOF
@@ -107,6 +111,13 @@ DEVICE_WHITELIST="0,1,2,3;"
 EOF
 if submit --device auto --device-num 2 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted trailing empty pool"; fi
 grep -Fq '分池格式无效' "$TEST_ROOT/out" || fail "missing malformed-pool error"
+bad_status=$(submit --devices status)
+grep -Fq 'INVALID: DEVICE_WHITELIST 分池格式无效' <<< "$bad_status" || fail "status did not diagnose malformed pools"
+cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
+DEVICE_WHITELIST="0,00;1,2"
+EOF
+if submit --device auto --device-num 2 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted alias card id with leading zero"; fi
+grep -Fq '分池格式无效' "$TEST_ROOT/out" || fail "missing canonical-card error"
 
 cat >> "$TEST_ROOT/config/taskqueue.conf" <<'EOF'
 DEVICE_GROUPS="0,1;2,3;4,5;6,7"
@@ -117,6 +128,8 @@ DEVICE_GROUP_AFFINITY=1
 EOF
 if submit --device auto --device-num 4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "accepted impossible logical/physical intersection"; fi
 grep -Fq '最大的有效池只有 2 张' "$TEST_ROOT/out" || fail "missing intersection capacity error"
+if submit --ignore-group-affinity --device 0,4 'echo bad' >"$TEST_ROOT/out" 2>&1; then fail "hardware override bypassed logical pools"; fi
+grep -Fq '不在同一个 DEVICE_WHITELIST 分池' "$TEST_ROOT/out" || fail "logical pool error missing under hardware override"
 
 cat > "$TEST_ROOT/project/task-submit.conf" <<'EOF'
 DEVICE_WHITELIST=0,1,2,3,4,5,6,7
