@@ -226,23 +226,118 @@ privileged. Restart the daemon after changing this setting.
 ## NPU usage statistics
 
 `pto-task --stats [--days N]` (or `task-submit --stats`) reports task count,
-card-hours, and sampled NPU utilization. An unprivileged caller sees only their
-own records; root sees the per-user aggregate. The report is read-only. Its
-sampler is an independent timer; it only reads NPU utilization for cards owned
-by running queue tasks and never participates in scheduling.
+card-hours and legacy sampled utilization, plus a separate in-task telemetry
+table: suspected idle card-hours, valid coverage, average computation utilization,
+valid samples and idle-event count. The telemetry table selects tasks by their
+start time; original task accounting retains its overlapping-time-window rules.
+Ordinary users see their own telemetry; root sees all users.
 
-Sampling and its timer are disabled by default. Enable it in the local
-configuration, then rerun `sudo bash setup.sh` to install and enable the timer;
-the task daemon does not need a restart:
+Sampling is opt-in in the administrator-owned local configuration:
 
 ```bash
 # /home/pypto-tools/pto-task/config/taskqueue.conf
 USAGE_SAMPLING_ENABLED=true
+USAGE_SAMPLE_INTERVAL=15
+USAGE_SAMPLE_TIMEOUT=2
+USAGE_SAMPLE_ROUND_TIMEOUT=6
+USAGE_IDLE_GRACE=60
+USAGE_IDLE_SECONDS=120
 ```
 
-Samples are stored in `state/usage/YYYYMMDD.csv`. The sampler uses a per-run
-lock and a timeout for every `npu-smi` call, so a stalled device cannot block
-the queue daemon.
+Deploy the updated code through the normal idle activation procedure. The daemon
+reads sampling configuration on startup/reload, and new jobs use those settings.
+Sampling now runs **inside each device job after acquiring its locks**, only for
+allocated cards. CPU-only jobs never start a probe. Setup retires the old standalone
+timer; its compatibility entry point performs no hardware queries. Old CSV samples
+remain readable by `--stats`.
+
+```bash
+task-submit --device-usage TASK_ID
+task-submit --device-usage TASK_ID --json
+task-submit --list
+```
+
+Each card is marked **suspected idle** only after the startup grace and a
+continuous interval of successful zero-computation samples. A single nonzero
+compute metric prevents the mark. HBM occupancy is auxiliary, not proof of active
+computation. Activity closes the event; missing/invalid data, timeouts and sampling
+gaps also close it at the last confirmed observation and become unknown. Short
+jobs need not produce an idle event. These are sampled observations, not proof
+that no kernel ran between samples. No task is killed and no allocation released
+based on telemetry. Submitters can modify their own advisory telemetry; it is
+separate from authoritative card-time accounting and scheduling.
+The sampler supports up to 64 devices in one allocation. Larger allocations run
+normally with telemetry disabled; telemetry availability does not change the
+workload's exit code.
+
+Queries are polled without blocking the workload, with at most two probes per
+job, a per-query deadline (2 seconds by default, at most 5), a one-second SIGTERM
+allowance before SIGKILL, and a round deadline (6 seconds by default, at most 10).
+Failed devices back off up to 300 seconds. A probe stuck in uninterruptible driver
+sleep cannot be guaranteed to die: it retains its probe slot, and task completion
+never waits indefinitely for it. A separate shared probe guard also prevents later
+jobs from spawning replacements while a stuck query still holds that guard.
+Probes inherit no scheduler device-lock descriptors. Captured stdout is limited
+to 64 KiB through nonblocking reads; driver log files are not size-limited by
+the sampler.
+
+A3 tables with an explicit physical-ID column use that mapping directly. Older
+logic-only tables require a verified physical-ID remap; both use `usages -i N -c C`.
+Ascend 950/A5 physical-ID tables use their explicit `Chip Phy-ID` mapping and
+`usages -i N` without `-c`. Logic IDs are never assumed to be physical IDs, and
+unrecognized hardware/driver formats remain unknown. These output formats are
+covered with fixtures; a new platform still requires validation against its
+actual driver output. See Huawei's [physical-ID remap reference](https://www.hiascend.com/document/detail/zh/Atlas%20200I%20A2/253RC1/re/npu/npusmi_059.html)
+and the [950 mapping/query implementation in SwanLab](https://github.com/SwanHubX/SwanLab/blob/main/swanlab/sdk/internal/probe_python/hardware_vendor/accelerator/huawei.py).
+
+Real-device checks on Ascend950DT / 9581 (board-reported software
+`25.6.rc2.b023`) confirmed the A5 layout above and successful `usages -i N`
+queries. Adding `-c 0` returned exit code 215 with
+`This device does not support input parameter of -c.` The A5 `phyid-remap`
+response uses `Chip Phy-ID` and also omits a logic ID; the sampler uses the
+explicit physical-ID table. Queries on that host intermittently exceeded both
+2-second and 5-second deadlines, including calls without a probe guard. A
+bounded sampling run recorded four valid samples and an idle event, then
+correctly transitioned to unknown on timeout. Keep query deadlines and backoff;
+a timeout provides no zero-utilization evidence.
+
+Records live in `state/usage/tasks/TASK_ID.json`, with task/user/device identity,
+timestamps, per-card totals and the most recent 16 events per card. Event counts
+and cumulative durations include older events too. Records survive normal task
+cleanup; administrator `--clean` removes telemetry older than 35 days. Interrupted
+or crashed samplers may leave incomplete records; live samples expire after two
+sampling intervals instead of claiming continued activity or idle time.
+
+### User sampling rankings
+
+Ordinary users can read aggregate rankings without root or a device allocation:
+
+```bash
+task-submit --usage-ranking
+task-submit --usage-ranking --days 7 --sort coverage --limit 20
+task-submit --usage-ranking --days 7 --sort utilization --json
+```
+
+The default is the top 20 users over seven days, sorted by mean computation
+utilization descending. `--sort coverage` selects valid sampling coverage;
+`--limit` accepts 1–100 and `--days 0` includes all retained records. Both metrics,
+valid/total sample counts, recorded card-seconds, suspected idle card-seconds and
+task/event counts appear in JSON. Each valid sample uses the maximum recognized
+AI Core, AI vector, AI CPU, AI cube or NPU utilization percentage. HBM occupancy
+and control-CPU usage are excluded. The mean is weighted by valid sample count;
+coverage is valid sampled intervals divided by recorded card duration. Missing
+utilization is `null` and unranked, never zero. Tasks are selected by start time,
+as in the telemetry table. This summarizes sampled, readable records, not every
+allocation on the host; unreadable/incomplete records are counted as skipped.
+Malformed records, invalid event timestamps and excessive JSON nesting are
+skipped without preventing other users' records from being ranked.
+
+The interface only reads stored telemetry and publishes user aggregates; no
+task IDs, commands, environments, individual events or login information are
+included. `--stats` retains its existing own-user restriction for ordinary
+callers. Rankings remain advisory because submitters can modify their own
+telemetry. JSON uses `schema_version: 1`, reports completeness with `status`,
+and returns the rows in `ranking`.
 
 ### Public card-hour monitoring (development preview)
 
@@ -385,3 +480,15 @@ idle-only installation and activation.
 
 For a concise Chinese usage guide, see [GUIDE_ZH.md](GUIDE_ZH.md). AI agents
 can use [skills/pto-task-operations/SKILL.md](skills/pto-task-operations/SKILL.md).
+Make the directory discoverable in each assistant's skill location, for example:
+
+```bash
+mkdir -p ~/.codex/skills ~/.claude/skills
+ln -s /absolute/path/to/npu-taskqueue/skills/pto-task-operations ~/.codex/skills/pto-task-operations
+ln -s /absolute/path/to/npu-taskqueue/skills/pto-task-operations ~/.claude/skills/pto-task-operations
+```
+
+If a shared host has a canonical skills directory, keep the skill there and link
+the assistant-specific entries to it instead. Installation does not overwrite an
+existing skill or edit user-specific assistant configuration. Assistants without
+a skill discovery mechanism can read `SKILL.md` directly.

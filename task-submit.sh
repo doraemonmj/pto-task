@@ -159,6 +159,13 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
     --no-device        不占卡（也是默认行为）。编译、CPU 任务用这个
     --device auto      需要在卡上跑时才分配；作业内用 $TASK_DEVICE 拿到卡号
 
+  task-submit 的任务粒度:
+    一个占卡任务只做一次独立的上板用例（一个 testcase / 一个 workload 配置）。
+    编译、依赖安装、生成输入、结果汇总等不占卡的准备和后处理应在任务外完成；
+    如果工具必须统一排队执行这些步骤，使用 --no-device。不要把多个用例、整套
+    benchmark 或 build + test + 汇总脚本打包进一个占卡任务。确需多个卡时，按该
+    单个用例的实际需要用 --device-num N；多次运行由调用方逐个提交。
+
 提交:
   task-submit --no-device --run "command"      不占卡执行（编译 / CPU 测试）
   task-submit "command"                        提交任务，返回 task-id（默认不分配 NPU 卡）
@@ -174,6 +181,9 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
   task-submit --wait <task-id>                 等待任务完成并实时输出日志
   task-submit --timeout N --wait <task-id>     自定义排队超时(秒，默认 600)
   task-submit --status <task-id>               查看任务状态
+  task-submit --device-usage <task-id> [--json] 查看设备采样和疑似空闲记录
+  task-submit --usage-ranking [--days N] [--sort utilization|coverage] [--limit N] [--json]
+                                             查看用户采样排名（默认近 7 天、利用率降序）
   task-submit --log <task-id>                  查看任务日志（已完成或运行中）
   task-submit --usage-monitor --json             只读卡时快照（今日、7天、30天）
   task-submit --stats [--days N]               查看 NPU 使用统计（默认近 7 天）
@@ -292,7 +302,7 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
             PTOAS_VERSION="$2"; shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
-        --version|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--help|-h)
+        --version|--device-usage|--usage-ranking|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--help|-h)
             break ;;
         # 未知选项必须硬失败。此处曾是 `*) break`，会把未识别的 flag 连同其后的
         # --run/--timeout 一起当作任务命令提交，且 RUN_MODE 未置位时静默 exit 0
@@ -1768,6 +1778,10 @@ clean_tasks() {
             fi
         done
     done
+    # Telemetry outlives the short-lived done/ records, but is bounded to 35 days.
+    if [[ "$(id -u)" -eq 0 && -d "$STATE_DIR/usage/tasks" ]]; then
+        find "$STATE_DIR/usage/tasks" -maxdepth 1 -type f -name 'task_*.json' -mmin +50400 -delete
+    fi
     echo "已清理 ${count} 个任务（${CLEAN_DAYS} 天前）"
 }
 
@@ -2073,6 +2087,10 @@ list_tasks() {
             [[ -n "$dev" ]] && dev_tag="${C_BOLD}[NPU:${dev}]${C_RESET} "
             [[ ${#cmd} -gt 80 ]] && cmd="${cmd:0:77}..."
             printf "  ${C_YELLOW}%-38s${C_RESET} %4s  %s%s\n" "$tid" "$age" "$dev_tag" "$cmd"
+            if [[ -f "$STATE_DIR/usage/tasks/$tid.json" ]]; then
+                printf '    '
+                python3 -I "$SCRIPT_DIR/device_usage.py" read "$STATE_DIR" "$tid" || true
+            fi
         done
         echo ""
     fi
@@ -2141,6 +2159,13 @@ case "${1:-}" in
     --wait)
         [[ -z "${2:-}" ]] && usage
         wait_task "$2"
+        ;;
+    --device-usage)
+        [[ -z "${2:-}" ]] && usage
+        exec python3 -I "$SCRIPT_DIR/device_usage.py" read "$STATE_DIR" "$2" "${@:3}"
+        ;;
+    --usage-ranking)
+        exec python3 -I "$SCRIPT_DIR/device_usage.py" ranking "$STATE_DIR" "${@:2}"
         ;;
     --status)
         [[ -z "${2:-}" ]] && usage
