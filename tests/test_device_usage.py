@@ -131,6 +131,15 @@ class ClassificationTests(unittest.TestCase):
         data = sampler.snapshot('task_1', 'example', start + 2)
         self.assertEqual(usage.describe(data), '曾疑似占卡空闲 12=1s；当前：未标记空闲')
 
+    def test_active_seconds_charge_gaps_closed_by_compute(self):
+        card = self.card()
+        for now, compute in ((0, 5), (15, 5), (30, 0), (60, 0), (75, 7), (105, 7)):
+            card.observe(now, {'compute': compute})
+        # A 45 s gap exceeds 2x the 15 s interval, so the last sample adds nothing.
+        card.observe(150, {'compute': 9})
+        self.assertEqual(card.data['valid_seconds'], 105)
+        self.assertEqual(card.data['active_seconds'], 60)
+
     def test_uninterruptible_probe_is_bounded_and_not_replaced(self):
         probes = usage.Probes(timeout=2, concurrency=1)
         proc = mock.Mock(pid=12345)
@@ -481,11 +490,12 @@ else:
 
 
 class RankingTests(unittest.TestCase):
-    def snapshot(self, user, duration=100, samples=10, compute=50, coverage=.5, age=0):
+    def snapshot(self, user, duration=100, samples=10, compute=50, coverage=.5, age=0, active=None):
         now = 1_000_000
         return dict(user=user, task_id='task_private_id', command='private command',
                     started_at=now - duration - age, updated_at=now - age, finished_at=now - age,
                     devices={'12': dict(idle_seconds=0., valid_seconds=duration * coverage,
+                        active_seconds=duration * coverage if active is None else active,
                         compute_sum=samples * compute, valid_samples=samples, samples=samples,
                         event_count=0)})
 
@@ -498,9 +508,9 @@ class RankingTests(unittest.TestCase):
              mock.patch.object(usage.time, 'time', return_value=1_000_000):
             data = usage.ranking(Path('/unused'), days=0)
         self.assertEqual([row['user'] for row in data['ranking']], ['alice', 'bob', 'unknown'])
-        self.assertEqual(data['ranking'][0]['mean_compute_utilization_pct'], 10)
+        self.assertEqual(data['ranking'][0]['active_time_ratio_pct'], 10)
         self.assertEqual(data['ranking'][0]['valid_coverage_pct'], 10)
-        self.assertIsNone(data['ranking'][2]['mean_compute_utilization_pct'])
+        self.assertIsNone(data['ranking'][2]['active_time_ratio_pct'])
         self.assertIsNone(data['ranking'][2]['rank'])
         self.assertNotIn('private command', json.dumps(data))
         self.assertNotIn('task_private_id', json.dumps(data))

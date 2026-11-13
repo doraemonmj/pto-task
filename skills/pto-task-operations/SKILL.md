@@ -175,10 +175,13 @@ a mapping by dividing card IDs by two or treating a logic ID as a physical ID.
 
 Use `task-submit --usage-ranking [--days N] [--sort utilization|coverage] [--json]`
 for public per-user sampling aggregates. It is read-only and requires no device
-allocation. The default order is mean computation utilization descending;
-coverage and sample counts explain incomplete evidence. Unknown utilization is
-unranked, not zero. These advisory rankings include only readable sampled tasks,
-selected by start time, and do not expose commands or individual task records.
+allocation. The default order is lowest card-active-time ratio first (two-day
+window): observed computing card-seconds divided by recorded card-seconds, capped
+at 100%, with an interval counted active only when the closing sample is nonzero
+and within twice the sampling interval. Coverage and sample counts explain
+incomplete evidence. A user without valid samples is unranked, not zero. These
+advisory rankings include only readable sampled tasks, selected by start time,
+and do not expose commands or individual task records.
 
 For archived daily server usage, use `task-submit --usage status` and
 `sudo task-submit --usage day --date YYYY-MM-DD`. The archive is administrator
