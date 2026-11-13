@@ -133,7 +133,7 @@ class Card:
         self.zero_since = None
         self.active = None
         self.data = dict(state='unknown', reason='not_sampled', observed_at=None,
-                         metrics=None, valid_seconds=0.0, idle_seconds=0.0,
+                         metrics=None, valid_seconds=0.0, idle_seconds=0.0, active_seconds=0.0,
                          samples=0, valid_samples=0, compute_sum=0.0, event_count=0, events=[])
 
     def close(self, reason):
@@ -161,6 +161,10 @@ class Card:
         data['compute_sum'] += values['compute']
         if continuous:
             data['valid_seconds'] += now - previous
+            # A gap is counted as active when the sample that closes it shows
+            # computation, so every second is attributed to at most one sample.
+            if values['compute'] > 0:
+                data['active_seconds'] += now - previous
         if values['compute'] > 0:
             self.close('activity')
             data['state'] = 'active'
@@ -523,6 +527,11 @@ def read_snapshot(state, task_id, now=None):
         for key in ('idle_seconds', 'valid_seconds', 'samples', 'valid_samples', 'compute_sum', 'event_count'):
             if not isinstance(card[key], (int, float)) or not math.isfinite(card[key]) or not 0 <= card[key] <= 10**12:
                 raise ValueError('invalid telemetry totals')
+        if 'active_seconds' in card:
+            active = card['active_seconds']
+            if (not isinstance(active, (int, float)) or not math.isfinite(active) or
+                    not 0 <= active <= card['valid_seconds'] + .001):
+                raise ValueError('invalid telemetry activity')
         if (card['valid_samples'] > card['samples'] or
                 card['compute_sum'] > 100 * card['valid_samples'] + .001 or
                 card['idle_seconds'] > card['valid_seconds'] + .001):
@@ -571,7 +580,7 @@ def records(state, now):
 
 
 def aggregate(snapshots, days, now, user=None):
-    """Weight utilization by valid sample count and coverage by card duration."""
+    """Weight usage by card duration and coverage by valid sampled duration."""
     totals = {}
     for data in snapshots:
         if user is not None and data['user'] != user:
@@ -580,20 +589,26 @@ def aggregate(snapshots, days, now, user=None):
             continue
         row = totals.setdefault(data['user'], dict(user=data['user'], task_count=0,
             suspected_idle_card_seconds=0., valid_card_seconds=0., recorded_card_seconds=0.,
-            compute_sum=0., valid_samples=0, total_samples=0, idle_events=0))
+            active_card_seconds=0., valid_samples=0, total_samples=0, idle_events=0))
         row['task_count'] += 1
         elapsed = max(0, (data['finished_at'] or min(now, data['updated_at'])) - data['started_at'])
         for card in data['devices'].values():
             row['suspected_idle_card_seconds'] += card['idle_seconds']
             row['valid_card_seconds'] += card['valid_seconds']
             row['recorded_card_seconds'] += elapsed
-            row['compute_sum'] += card['compute_sum']
+            active = card.get('active_seconds')
+            if active is None:
+                # A record without the counter estimates activity as sampled time
+                # outside a suspected idle run.
+                active = max(0., card['valid_seconds'] - card['idle_seconds'])
+            row['active_card_seconds'] += active
             row['valid_samples'] += card['valid_samples']
             row['total_samples'] += card['samples']
             row['idle_events'] += card['event_count']
     for row in totals.values():
-        row['mean_compute_utilization_pct'] = (row.pop('compute_sum') / row['valid_samples']
-                                               if row['valid_samples'] else None)
+        row['active_time_ratio_pct'] = (
+            min(100., 100 * row['active_card_seconds'] / row['recorded_card_seconds'])
+            if row['recorded_card_seconds'] and row['valid_samples'] else None)
         row['valid_coverage_pct'] = (min(100., 100 * row['valid_card_seconds'] / row['recorded_card_seconds'])
                                      if row['recorded_card_seconds'] else None)
     return list(totals.values())
@@ -605,12 +620,12 @@ def report(state, days):
     user = None if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
     rows = aggregate(snapshots, days, now, user)
     print('\n作业内采样（按任务开始时间筛选；疑似空闲仅供参考）')
-    print('用户                疑似空闲卡时(h)  有效覆盖率  平均计算利用率  有效样本  空闲事件')
+    print('用户                疑似空闲卡时(h)  有效覆盖率  用卡时间占比  有效样本  空闲事件')
     for row in sorted(rows, key=lambda row: row['user']):
         coverage = percent(row['valid_coverage_pct'])
-        utilization = percent(row['mean_compute_utilization_pct'])
+        usage_time = percent(row['active_time_ratio_pct'])
         print(f"{row['user']:20s} {row['suspected_idle_card_seconds'] / 3600:10.3f} "
-              f"{coverage:>10s} {utilization:>12s} {int(row['valid_samples']):8d} {int(row['idle_events']):8d}")
+              f"{coverage:>10s} {usage_time:>12s} {int(row['valid_samples']):8d} {int(row['idle_events']):8d}")
     if not rows:
         print('(无作业内采样记录)')
 
@@ -626,7 +641,7 @@ def ranking(state, days=2, sort='utilization', limit=20):
     # No task IDs, commands, environments, per-card events or sessions are emitted.
     rows = aggregate(snapshots, days, now)
     skipped = quality['skipped_records']
-    key = 'mean_compute_utilization_pct' if sort == 'utilization' else 'valid_coverage_pct'
+    key = 'active_time_ratio_pct' if sort == 'utilization' else 'valid_coverage_pct'
     rows.sort(key=lambda row: (row[key] is None, row[key] or 0, row['user']))
     for index, row in enumerate(rows, 1):
         row['rank'] = index if row[key] is not None else None
@@ -637,12 +652,12 @@ def ranking(state, days=2, sort='utilization', limit=20):
 
 
 def print_ranking(data):
-    metric = '平均计算利用率' if data['sort'] == 'utilization' else '有效采样覆盖率'
+    metric = '用卡时间占比' if data['sort'] == 'utilization' else '有效采样覆盖率'
     print(f'采样排名（按用户；{metric}升序，低者在前；按任务开始时间筛选；仅供参考）')
-    print('名次  用户                  平均计算利用率  有效覆盖率  有效样本  疑似空闲卡时(h)')
+    print('名次  用户                  用卡时间占比  有效覆盖率  有效样本  疑似空闲卡时(h)')
     for row in data['ranking']:
         rank = '-' if row['rank'] is None else str(row['rank'])
-        print(f"{rank:>4s}  {row['user']:20s} {percent(row['mean_compute_utilization_pct']):>12s} "
+        print(f"{rank:>4s}  {row['user']:20s} {percent(row['active_time_ratio_pct']):>12s} "
               f"{percent(row['valid_coverage_pct']):>10s} {int(row['valid_samples']):8d} "
               f"{row['suspected_idle_card_seconds'] / 3600:14.3f}")
     if not data['ranking']:
