@@ -168,6 +168,7 @@ credentials in it. The software does not store or print credentials.
 | `SCHEDULER_MODE` | `backfill` | `backfill` for opportunistic throughput, or `pool_aware_reservation` for pool-aware multi-device reservation |
 | `POOL_AWARE_RESERVATION_MIN_DEVICES` | `2` | Minimum request size that creates a reservation in `pool_aware_reservation` |
 | `MAX_CONCURRENT_8_CARD_TASKS` | `0` | Optional per-host limit for exactly eight-card jobs; `0` disables it |
+| `PRIORITY_AGING_SECONDS` | `1800` | Wait after which an ordinary task joins the priority head bucket; `0` disables priority ordering |
 | `MAX_TIME_HARD_CAP` | `0` | Server maximum task duration; `0` means unlimited |
 | `KILL_GRACE` | `5` | Seconds from SIGTERM to SIGKILL |
 | `PTOAS_BASE` | `/usr/local/ptoas` | Default root containing installed PTOAS versions; submitter environment takes precedence |
@@ -196,10 +197,13 @@ idle.
 ### Scheduler module architecture
 
 Scheduling uses a shared planning core plus independently selectable policy
-modules. `schedulers/_core.sh` owns FIFO traversal, the per-task resource
-snapshot, host admission limits, decision validation, and the final call into
-the daemon's atomic claim/start path. A policy such as `backfill.sh` or
-`pool_aware_reservation.sh` may only return `start`, `defer`, or `stop` through
+modules. `schedulers/_core.sh` owns pending-queue ordering, the per-task
+resource snapshot, host admission limits, decision validation, and the final
+call into the daemon's atomic claim/start path. It sources
+`schedulers/_priority.sh` for the head-of-queue grants; with
+`PRIORITY_AGING_SECONDS=0` the pending order is plain FIFO. A policy such as
+`backfill.sh` or `pool_aware_reservation.sh` may only return `start`, `defer`,
+or `stop` through
 the core decision helpers; it does not move queue files or launch processes.
 Every `start` is revalidated immediately before claim, including device count,
 effective auto pool, current occupancy, and concurrency caps.
@@ -210,9 +214,39 @@ are `scheduler_validate_config`, `scheduler_begin_tick`,
 `scheduler_end_tick`, and `scheduler_task_started`. Safe lowercase identifiers
 are resolved to root-managed `schedulers/<mode>.sh` files, so adding a policy
 does not require changing a daemon-side name list; `setup.sh` installs all
-repository scheduler files. The leading-underscore core cannot be selected as
-a mode. Installed scheduler files and their directory must remain root-owned
-and not group/world-writable.
+repository scheduler files. The leading-underscore files (`_core.sh`,
+`_priority.sh`) cannot be selected as a mode. Installed scheduler files and
+their directory must remain root-owned and not group/world-writable.
+
+### Priority queue
+
+An administrator can give a user time-limited head-of-queue ordering:
+
+```bash
+sudo task-submit --priority grant alice              # 14 days
+sudo task-submit --priority grant alice --days 3
+task-submit --priority list                          # any local user
+sudo task-submit --priority revoke alice
+```
+
+Grants live in `config/taskqueue-priority.conf` next to the queue
+configuration, one `<user> <expiry_epoch> <granted_epoch>` line each, and are
+read on every scheduling tick: a grant takes effect and lapses without a daemon
+restart. The duration defaults to and is capped at `PRIORITY_GRANT_MAX_DAYS`
+(14). An active grant cannot be extended — revoke it, or grant again after it
+expires; that is what keeps the permission a renewable, explicit decision
+rather than a permanent one.
+
+While a grant is active, that user's pending tasks are considered before
+ordinary tasks, and each bucket keeps FIFO order. Fairness comes from
+`PRIORITY_AGING_SECONDS` (default 1800; `0` disables priority ordering): a task
+that has waited that long joins the head bucket at its true FIFO position, so a
+grant can only reorder tasks younger than the threshold and every ordinary
+task reaches the head bucket after bounded waiting. Eligibility is recomputed
+on every scheduling tick, so a task still pending after expiry drops back to
+ordinary order. Priority never preempts a running task and never
+bypasses concurrency limits, device pools, plane affinity or the
+`pool_aware_reservation` barrier — it only changes queue order.
 
 ### Task execution identity
 
@@ -227,18 +261,25 @@ privileged. Restart the daemon after changing this setting.
 
 `pto-task --stats [--days N]` (or `task-submit --stats`) reports task count,
 card-hours and legacy sampled utilization, plus a separate in-task telemetry
-table: suspected idle card-hours, valid coverage, card-active-time ratio,
-valid samples and idle-event count. The telemetry table selects tasks by their
-start time; original task accounting retains its overlapping-time-window rules.
-Ordinary users see their own telemetry; root sees all users.
+table: actual card-use hours, card-active-time ratio, suspected idle card-hours,
+sampling completeness and valid samples. The telemetry table selects tasks by
+their start time; original task accounting retains its
+overlapping-time-window rules. Ordinary users see their own telemetry; root
+sees all users.
 
 `--stats`, `--device-usage` and `--usage-ranking` share one vocabulary: **valid
 samples** count successful per-card queries (cards are sampled every 15 seconds),
 so they scale with cards × duration and failed queries count only as attempts;
-**valid coverage** is valid sampled card-seconds / recorded card-seconds;
+**actual card-use hours** is card-seconds with observed computation / 3600
+(compile, initialization and idle time are excluded);
 **card-active-time ratio** is card-seconds with observed computation / recorded
 card-seconds, capped at 100%; **suspected idle** needs 60 continuous seconds of
-valid zero-computation samples. `--usage-ranking` also excludes tasks whose
+valid zero-computation samples; **sampling completeness** is valid sampled
+card-seconds / recorded card-seconds and measures how much of the held card time
+the sampler actually observed, not how busy the cards were — its first and last
+intervals and any sampling gap are excluded from the numerator but remain in the
+denominator, so it is normally below 100% and the active-time ratio can never
+exceed it. `--usage-ranking` also excludes tasks whose
 overall wall-clock hold is 30 seconds or less: shorter than two sampling
 intervals, they have too few samples to rank fairly. All of these are advisory,
 not authoritative card-time accounting.
@@ -338,7 +379,7 @@ ratio first. Tasks held for 30 seconds or less overall are excluded from the
 ranking and counted in the `short_tasks_excluded` output field. A sampled interval counts as active only when the sample that closes
 it shows a nonzero compute metric, and only if that sample follows the previous
 one within twice the sampling interval; gaps are attributed to no sample.
-`--sort coverage` selects valid sampling coverage; `--limit` accepts 1–100 and
+`--sort coverage` selects sampling completeness; `--limit` accepts 1–100 and
 `--days 0` includes all retained records. Both metrics, valid/total sample counts,
 recorded card-seconds, suspected idle card-seconds and task/event counts appear in
 JSON. Each valid sample uses the maximum recognized AI Core, AI vector, AI CPU, AI

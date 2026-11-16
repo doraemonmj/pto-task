@@ -574,5 +574,64 @@ class RankingTests(unittest.TestCase):
         self.assertEqual([row['user'] for row in data['ranking']], ['alice', 'bob'])
 
 
+class ReportColumnTests(unittest.TestCase):
+    NOW = 1_000_000
+
+    def snapshot(self, user='alice'):
+        return dict(user=user, task_id='task_private_id', command='private command',
+                    started_at=self.NOW - 100, updated_at=self.NOW, finished_at=self.NOW,
+                    devices={'12': dict(idle_seconds=0., valid_seconds=50.,
+                        active_seconds=50., compute_sum=500., valid_samples=10,
+                        samples=10, event_count=0)})
+
+    def assert_ordered(self, header, labels):
+        positions = [header.index(label) for label in labels]
+        self.assertEqual(positions, sorted(positions), header)
+
+    def test_stats_header_orders_usage_first_and_names_completeness(self):
+        with mock.patch.object(usage, 'records', return_value=([self.snapshot()], {'skipped_records': 0})), \
+             mock.patch.object(usage.time, 'time', return_value=self.NOW), \
+             mock.patch.object(usage.os, 'geteuid', return_value=0), \
+             contextlib.redirect_stdout(io.StringIO()) as captured:
+            usage.report(Path('/unused'), 7)
+        text = captured.getvalue()
+        header = next(line for line in text.splitlines() if line.startswith('用户'))
+        self.assert_ordered(header, ('实际用卡时间(h)', '占卡有效时间', '疑似空闲卡时(h)',
+                                    '采样完整度', '有效样本'))
+        self.assertNotIn('空闲事件', header)
+        self.assertNotIn('有效覆盖率', text)
+        self.assertNotIn('用卡时间占比', text)
+        row = next(line for line in text.splitlines() if line.startswith('alice'))
+        # The snapshot's card computes for 50 of the 100 held seconds.
+        self.assertIn(f'{50 / 3600:15.3f}', row)
+        self.assertNotIn(f'{100 / 3600:15.3f}', row)
+
+    def test_ranking_header_and_sort_label_use_the_same_order(self):
+        with mock.patch.object(usage, 'records', return_value=([self.snapshot()], {'skipped_records': 0})), \
+             mock.patch.object(usage.time, 'time', return_value=self.NOW):
+            data = usage.ranking(Path('/unused'), days=7, sort='coverage')
+        # The JSON contract keeps its historical key and basis name.
+        self.assertEqual(data['coverage_basis'], 'recorded_card_seconds')
+        self.assertEqual(data['ranking'][0]['valid_coverage_pct'], 50)
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            usage.print_ranking(data)
+        lines = captured.getvalue().splitlines()
+        self.assertIn('采样完整度', lines[0])
+        self.assertNotIn('有效覆盖率', '\n'.join(lines))
+        self.assertNotIn('用卡时间占比', '\n'.join(lines))
+        self.assert_ordered(lines[1], ('实际用卡时间(h)', '占卡有效时间', '疑似空闲卡时(h)',
+                                       '采样完整度', '有效样本'))
+
+    def test_ranking_utilization_label_matches_the_column(self):
+        with mock.patch.object(usage, 'records', return_value=([self.snapshot()], {'skipped_records': 0})), \
+             mock.patch.object(usage.time, 'time', return_value=self.NOW):
+            data = usage.ranking(Path('/unused'), days=7, sort='utilization')
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            usage.print_ranking(data)
+        lines = captured.getvalue().splitlines()
+        self.assertIn('占卡有效时间', lines[0])
+        self.assertNotIn('用卡时间占比', '\n'.join(lines))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -6,6 +6,9 @@
 # stop; daemon core owns queue traversal, validates every start decision, and
 # performs the atomic pending -> running transition.
 
+# shellcheck source=_priority.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_priority.sh"
+
 SCHEDULER_CORE_API_VERSION=1
 
 SCHEDULER_DECISION=""
@@ -498,6 +501,80 @@ scheduler_start_planned_task() {
     start_pending_task "$task_file" "$task_id" "$assigned" "$pending_device_count"
 }
 
+# --- Priority ordering ------------------------------------------------------
+#
+# Head-of-queue grants are evaluated on every tick, so they need no timer and
+# expire on their own. A task joins the head bucket when its owner holds an
+# unexpired grant or when it has waited PRIORITY_AGING_SECONDS. Both buckets
+# keep FIFO order.
+#
+# Aging is what bounds an ordinary user's wait. Submission order is queue order,
+# so an aged task re-enters the head bucket at its true FIFO position: a grant
+# can reorder only tasks younger than the threshold, and every ordinary task
+# reaches the head bucket after waiting at most the threshold (plus the backlog
+# older than it). ctime is the submission clock because a file owner can
+# backdate mtime with touch, while ctime only moves forward.
+#
+# PRIORITY_AGING_SECONDS=0 disables the mechanism and restores plain FIFO.
+
+SCHEDULER_ORDERED_TASKS=()
+
+scheduler_order_pending_tasks() {
+    local file owner ctime rest line now threshold
+    local -a files head=() normal=()
+    local -A eligible=()
+
+    SCHEDULER_ORDERED_TASKS=()
+    threshold="${PRIORITY_AGING_SECONDS:-0}"
+    files=( "$PENDING_DIR"/task_* )
+    (( ${#files[@]} )) || return 0
+    [[ -f "${files[0]}" ]] || return 0
+
+    # Without aging there is no bound on what a grant could postpone, so the
+    # whole mechanism stays off.
+    if [[ ! "$threshold" =~ ^[0-9]+$ ]] || (( threshold == 0 )); then
+        SCHEDULER_ORDERED_TASKS=("${files[@]}")
+        return 0
+    fi
+
+    # The ledger library is installed with this core. If it is absent, the
+    # queue still dispatches in plain FIFO rather than losing the tick.
+    if ! declare -F priority_load_grants >/dev/null; then
+        SCHEDULER_ORDERED_TASKS=("${files[@]}")
+        return 0
+    fi
+
+    priority_load_grants
+    printf -v now '%(%s)T' -1
+
+    # One stat call carries the owner and ctime of every pending file. A failed
+    # or partial result leaves those tasks unclassified; they stay in FIFO order
+    # instead of disappearing from the tick.
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        owner="${line%% *}"
+        rest="${line#* }"
+        ctime="${rest%% *}"
+        file="${rest#* }"
+        [[ "$ctime" =~ ^[0-9]+$ ]] || continue
+        if [[ -n "${PRIORITY_GRANT_UNTIL[$owner]:-}" ]] ||
+           (( now - ctime >= threshold )); then
+            eligible["$file"]=1
+        fi
+    done < <(stat -c '%U %Z %n' -- "${files[@]}" 2>/dev/null || true)
+
+    for file in "${files[@]}"; do
+        [[ -f "$file" && "$file" != *.env ]] || continue
+        [[ -n "${eligible[$file]:-}" ]] && head+=("$file")
+    done
+    for file in "${files[@]}"; do
+        [[ -f "$file" && "$file" != *.env ]] || continue
+        [[ -n "${eligible[$file]:-}" ]] && continue
+        normal+=("$file")
+    done
+    SCHEDULER_ORDERED_TASKS=("${head[@]}" "${normal[@]}")
+}
+
 # Traverse the pending queue once. Policy modules see a stable per-task snapshot
 # and return exactly one decision; all mutation remains in daemon core.
 scheduler_schedule_tick() {
@@ -509,7 +586,8 @@ scheduler_schedule_tick() {
         return 1
     fi
 
-    for task_file in "$PENDING_DIR"/task_*; do
+    scheduler_order_pending_tasks
+    for task_file in "${SCHEDULER_ORDERED_TASKS[@]}"; do
         [[ -f "$task_file" ]] || continue
         [[ "$task_file" == *.env ]] && continue
 

@@ -34,12 +34,14 @@ invalid module settings are rejected instead of silently falling back. The
 mode is read when the daemon starts; change it only while the queue is idle,
 then restart the service.
 
-The two policies share `app/schedulers/_core.sh`. The core owns queue traversal,
-host admission, allocation validation, and atomic execution; selectable API-v2
-modules only return scheduling decisions. `SCHEDULER_MODE` is a safe lowercase
-identifier resolved to a root-managed `app/schedulers/<mode>.sh`, not an
-arbitrary path. A new repository module is installed automatically by
-`setup.sh`; `_core.sh` cannot be selected as a policy.
+The two policies share `app/schedulers/_core.sh`, which sources
+`app/schedulers/_priority.sh` for the priority ledger. The core owns queue
+ordering, host admission, allocation validation, and atomic execution;
+selectable API-v2 modules only return scheduling decisions. `SCHEDULER_MODE` is
+a safe lowercase identifier resolved to a root-managed
+`app/schedulers/<mode>.sh`, not an arbitrary path. A new repository module is
+installed automatically by `setup.sh`; the leading-underscore files cannot be
+selected as policies.
 
 `DEVICE_GROUPS` describes which cards share a communication domain (HCCS plane)
 on this host, as semicolon-separated groups of comma-separated card ids, for
