@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "enabled": true,
-  "target": "",
+  "target": "c29cc060ea4bd20b3fcd0db0c0cc9c304bfa1eba",
   "activation": "automatic",
-  "sequence": 0,
+  "sequence": 1,
   "allow_rollback": false
 }
