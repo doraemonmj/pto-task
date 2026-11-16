@@ -627,11 +627,11 @@ def report(state, days):
     user = None if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
     rows = aggregate(snapshots, days, now, user)
     print('\n作业内采样（按任务开始时间筛选；疑似空闲仅供参考）')
-    print('用户                 占卡总时间(h)  占卡有效时间 疑似空闲卡时(h) 采样完整度 有效样本')
+    print('用户                 实际用卡时间(h) 占卡有效时间 疑似空闲卡时(h) 采样完整度 有效样本')
     for row in sorted(rows, key=lambda row: row['user']):
         usage_time = percent(row['active_time_ratio_pct'])
         completeness = percent(row['valid_coverage_pct'])
-        print(f"{row['user']:20s} {row['recorded_card_seconds'] / 3600:14.3f} "
+        print(f"{row['user']:20s} {row['active_card_seconds'] / 3600:15.3f} "
               f"{usage_time:>12s} "
               f"{row['suspected_idle_card_seconds'] / 3600:15.3f} "
               f"{completeness:>10s} {int(row['valid_samples']):8d}")
@@ -677,10 +677,10 @@ def print_ranking(data):
     metric = '占卡有效时间' if data['sort'] == 'utilization' else '采样完整度'
     print(f'采样排名（按用户；{metric}升序，低者在前；按任务开始时间筛选；'
           f'不含 {MIN_RANKED_TASK_SECONDS} 秒以内的任务；仅供参考）')
-    print('名次  用户                 占卡总时间(h)  占卡有效时间 疑似空闲卡时(h) 采样完整度 有效样本')
+    print('名次  用户                 实际用卡时间(h) 占卡有效时间 疑似空闲卡时(h) 采样完整度 有效样本')
     for row in data['ranking']:
         rank = '-' if row['rank'] is None else str(row['rank'])
-        print(f"{rank:>4s}  {row['user']:20s} {row['recorded_card_seconds'] / 3600:14.3f} "
+        print(f"{rank:>4s}  {row['user']:20s} {row['active_card_seconds'] / 3600:15.3f} "
               f"{percent(row['active_time_ratio_pct']):>12s} "
               f"{row['suspected_idle_card_seconds'] / 3600:15.3f} "
               f"{percent(row['valid_coverage_pct']):>10s} {int(row['valid_samples']):8d}")

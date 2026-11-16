@@ -261,16 +261,17 @@ privileged. Restart the daemon after changing this setting.
 
 `pto-task --stats [--days N]` (or `task-submit --stats`) reports task count,
 card-hours and legacy sampled utilization, plus a separate in-task telemetry
-table: held card-hours, card-active-time ratio, suspected idle card-hours,
-sampling completeness and valid samples. The telemetry table
-selects tasks by their start time; original task accounting retains its
-overlapping-time-window rules.
-Ordinary users see their own telemetry; root sees all users.
+table: actual card-use hours, card-active-time ratio, suspected idle card-hours,
+sampling completeness and valid samples. The telemetry table selects tasks by
+their start time; original task accounting retains its
+overlapping-time-window rules. Ordinary users see their own telemetry; root
+sees all users.
 
 `--stats`, `--device-usage` and `--usage-ranking` share one vocabulary: **valid
 samples** count successful per-card queries (cards are sampled every 15 seconds),
 so they scale with cards × duration and failed queries count only as attempts;
-**held card-hours** is recorded card-seconds / 3600, the denominator of the ratio;
+**actual card-use hours** is card-seconds with observed computation / 3600
+(compile, initialization and idle time are excluded);
 **card-active-time ratio** is card-seconds with observed computation / recorded
 card-seconds, capped at 100%; **suspected idle** needs 60 continuous seconds of
 valid zero-computation samples; **sampling completeness** is valid sampled

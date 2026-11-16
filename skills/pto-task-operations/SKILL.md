@@ -61,8 +61,8 @@ acquiring the device locks; CPU jobs never sample. `--stats [--days N]`,
 
 - **Valid sample** — one successful per-card query. The count grows with cards ×
   duration; failed queries count only as attempts.
-- **Held card-hours** — recorded card-seconds / 3600, the denominator of the
-  ratio below.
+- **Actual card-use hours** — card-seconds with observed compute / 3600; compile,
+  initialization and idle time are excluded.
 - **Card-active-time ratio** — card-seconds with observed compute / recorded
   card-seconds, capped at 100%. Sampling gaps count for neither; no valid sample
   means unknown, never zero.
