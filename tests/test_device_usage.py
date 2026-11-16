@@ -596,9 +596,14 @@ class ReportColumnTests(unittest.TestCase):
             usage.report(Path('/unused'), 7)
         text = captured.getvalue()
         header = next(line for line in text.splitlines() if line.startswith('用户'))
-        self.assert_ordered(header, ('用卡时间占比', '疑似空闲卡时(h)',
+        self.assert_ordered(header, ('占卡总时间(h)', '占卡有效时间', '疑似空闲卡时(h)',
                                     '采样完整度', '有效样本', '空闲事件'))
         self.assertNotIn('有效覆盖率', text)
+        self.assertNotIn('用卡时间占比', text)
+        row = next(line for line in text.splitlines() if line.startswith('alice'))
+        # The snapshot holds one card for 100 seconds, so total held time is
+        # 100/3600 hours.
+        self.assertIn(f'{100 / 3600:14.3f}', row)
 
     def test_ranking_header_and_sort_label_use_the_same_order(self):
         with mock.patch.object(usage, 'records', return_value=([self.snapshot()], {'skipped_records': 0})), \
@@ -612,8 +617,19 @@ class ReportColumnTests(unittest.TestCase):
         lines = captured.getvalue().splitlines()
         self.assertIn('采样完整度', lines[0])
         self.assertNotIn('有效覆盖率', '\n'.join(lines))
-        self.assert_ordered(lines[1], ('用卡时间占比', '疑似空闲卡时(h)',
+        self.assertNotIn('用卡时间占比', '\n'.join(lines))
+        self.assert_ordered(lines[1], ('占卡总时间(h)', '占卡有效时间', '疑似空闲卡时(h)',
                                        '采样完整度', '有效样本'))
+
+    def test_ranking_utilization_label_matches_the_column(self):
+        with mock.patch.object(usage, 'records', return_value=([self.snapshot()], {'skipped_records': 0})), \
+             mock.patch.object(usage.time, 'time', return_value=self.NOW):
+            data = usage.ranking(Path('/unused'), days=7, sort='utilization')
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            usage.print_ranking(data)
+        lines = captured.getvalue().splitlines()
+        self.assertIn('占卡有效时间', lines[0])
+        self.assertNotIn('用卡时间占比', '\n'.join(lines))
 
 
 if __name__ == '__main__':
