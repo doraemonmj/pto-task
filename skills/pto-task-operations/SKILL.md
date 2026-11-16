@@ -61,13 +61,17 @@ acquiring the device locks; CPU jobs never sample. `--stats [--days N]`,
 
 - **Valid sample** — one successful per-card query. The count grows with cards ×
   duration; failed queries count only as attempts.
-- **Valid coverage** — valid sampled card-seconds / recorded card-seconds.
 - **Card-active-time ratio** — card-seconds with observed compute / recorded
   card-seconds, capped at 100%. Sampling gaps count for neither; no valid sample
   means unknown, never zero.
 - **Suspected idle** — 60 continuous seconds of valid zero-compute samples from
   the moment all cards are held. A nonzero sample closes it; timeouts and gaps
   are unknown, never idle. Assessed per card.
+- **Sampling completeness** — continuous valid sampled card-seconds / recorded
+  card-seconds. It measures how trustworthy the sampling data is, not how busy
+  the cards are: task head/tail and sampling gaps stay in the denominator while
+  leaving the numerator, so it is usually below 100% and the active-time ratio
+  can never exceed it.
 
 `--stats` is own-user unless run as root; `--usage-ranking` aggregates all users
 (default two days, lowest ratio first) and excludes tasks held 30 seconds or less
@@ -84,3 +88,10 @@ in the repository README and `GUIDE_ZH.md`. Deploy as root only when the queue i
 idle; `deploy.sh` updates files but skips the daemon restart while a task runs, and
 must be rerun after the queue drains. Start the daemon, enable usage collectors,
 or change scheduler configuration only on an explicit request.
+
+Granting priority queueing is also an administrator action: `sudo task-submit
+--priority grant <user> --days N` (at most 14 days, never extendable),
+`--priority revoke <user>` and `--priority list`. It only changes waiting order;
+it never preempts a running task or bypasses concurrency, device-pool or
+reservation limits, and ordinary tasks join the priority bucket once they have
+waited `PRIORITY_AGING_SECONDS`.

@@ -43,7 +43,9 @@ grep -Fq "export GCC15_ROOT=''" <<< "$installed_pypto_exports"
 [[ -f "$INSTALL_ROOT/app/schedulers/backfill.sh" ]]
 [[ -f "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh" ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers")" == 755 ]]
+[[ -f "$INSTALL_ROOT/app/schedulers/_priority.sh" ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/_core.sh")" == 644 ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/_priority.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/backfill.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh")" == 644 ]]
 grep -Fqx 'SCHEDULER_CORE_API_VERSION=1' "$INSTALL_ROOT/app/schedulers/_core.sh"
@@ -107,6 +109,7 @@ grep -q '^SCHEDULER_MODE="backfill"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueu
 grep -q '^POOL_AWARE_RESERVATION_MIN_DEVICES=2[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^PTOAS_BASE="/usr/local/ptoas"[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 grep -q '^MAX_CONCURRENT_8_CARD_TASKS=0[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
+grep -q '^PRIORITY_AGING_SECONDS=1800[[:space:]]*#' "$INSTALL_ROOT/config/taskqueue.conf"
 if grep -Eq '^AUTO_UPDATE_(REPOSITORY|BRANCH)=' "$INSTALL_ROOT/config/taskqueue.conf"; then
     echo 'error: taskqueue config still contains retired branch-HEAD updater settings' >&2
     exit 1
@@ -401,6 +404,7 @@ bash "$REPO_DIR/tests/test_auto_update_retry.sh"
 bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
 bash "$REPO_DIR/tests/test_eight_card_limit.sh"
 bash "$REPO_DIR/tests/test_scheduler_core.sh"
+bash "$REPO_DIR/tests/test_priority_queue.sh"
 bash "$REPO_DIR/tests/test_pool_aware_reservation.sh"
 bash "$REPO_DIR/tests/test_device_group_affinity.sh"
 bash "$REPO_DIR/tests/test_whitelist_pools.sh"

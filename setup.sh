@@ -450,13 +450,17 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
 install_app_file "$SCRIPT_DIR/pypto-setup.sh" "$APP_DIR/pypto-setup" 755
-# Install the shared core first, then policies, and replace the daemon last.
-# Policy modules retain an API-v1 upgrade bridge, so every intermediate state
-# remains restartable if a file-by-file installation is interrupted.
+# Install the shared core after the library it sources, then policies, and
+# replace the daemon last. Policy modules retain an API-v1 upgrade bridge, so
+# every intermediate state remains restartable if a file-by-file installation
+# is interrupted.
+install_app_file "$SCRIPT_DIR/schedulers/_priority.sh" "$SCHEDULER_APP_DIR/_priority.sh" 644
 install_app_file "$SCRIPT_DIR/schedulers/_core.sh" "$SCHEDULER_APP_DIR/_core.sh" 644
 for scheduler_source in "$SCRIPT_DIR"/schedulers/*.sh; do
     [[ -f "$scheduler_source" ]] || continue
-    [[ "$(basename "$scheduler_source")" != _core.sh ]] || continue
+    case "$(basename "$scheduler_source")" in
+        _core.sh|_priority.sh) continue ;;
+    esac
     install_app_file "$scheduler_source" "$SCHEDULER_APP_DIR/$(basename "$scheduler_source")" 644
 done
 install_app_file "$SCRIPT_DIR/task-daemon.sh" "$APP_DIR/task-daemon" 755

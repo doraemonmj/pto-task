@@ -41,6 +41,16 @@ POLL_INTERVAL=0.2
 KILL_GRACE=${KILL_GRACE:-5}   # --kill 后等待 SIGTERM 优雅退出的宽限期(秒)，超时升级到 SIGKILL
 MAX_CONCURRENT=${MAX_CONCURRENT:-1}
 SCHEDULER_MODE=${SCHEDULER_MODE:-backfill}
+# Head-of-queue aging: an ordinary task that has waited this long competes with
+# granted users instead of being postponed indefinitely. 0 disables priority
+# ordering entirely. The ledger lives beside the queue configuration and is
+# written only by `sudo task-submit --priority`.
+PRIORITY_AGING_SECONDS=${PRIORITY_AGING_SECONDS:-1800}
+if [[ ! "$PRIORITY_AGING_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "error: PRIORITY_AGING_SECONDS must be a non-negative integer" >&2
+    exit 1
+fi
+PRIORITY_FILE="${CONF_FILE%.conf}-priority.conf"
 # Optional per-host admission limit for jobs that request exactly eight cards.
 # Zero keeps historical scheduling behavior, so code updates do not enable the
 # policy on hosts whose preserved local configuration does not opt in.
@@ -309,7 +319,7 @@ load_runtime_devices() {
 # SIGHUP 热加载不会改变 BASE_DIR；目录迁移仍需要停服。
 reload_runtime_config() {
     local old_state="$STATE_DIR"
-    local new_max new_cap new_grace
+    local new_max new_cap new_grace new_priority
 
     # 配置由 root 管理。只在信号路径读取明确支持热更新的键，不执行 shell。
     read_hot_key() {
@@ -328,10 +338,12 @@ reload_runtime_config() {
     new_max=$(read_hot_key MAX_CONCURRENT)
     new_cap=$(read_hot_key MAX_TIME_HARD_CAP)
     new_grace=$(read_hot_key KILL_GRACE)
+    new_priority=$(read_hot_key PRIORITY_AGING_SECONDS)
 
     [[ "$new_max" =~ ^[1-9][0-9]*$ ]] && MAX_CONCURRENT="$new_max"
     [[ "$new_cap" =~ ^[0-9]+$ ]] && MAX_TIME_HARD_CAP="$new_cap"
     [[ "$new_grace" =~ ^[0-9]+$ ]] && KILL_GRACE="$new_grace"
+    [[ "$new_priority" =~ ^[0-9]+$ ]] && PRIORITY_AGING_SECONDS="$new_priority"
     local sample_key sample_value
     sample_value=$(read_hot_key USAGE_SAMPLING_ENABLED)
     case "$sample_value" in
@@ -345,7 +357,7 @@ reload_runtime_config() {
     done
     STATE_DIR="$old_state"
     load_runtime_devices
-    log "config reloaded: max_concurrent=$MAX_CONCURRENT hard_cap=$MAX_TIME_HARD_CAP kill_grace=$KILL_GRACE"
+    log "config reloaded: max_concurrent=$MAX_CONCURRENT hard_cap=$MAX_TIME_HARD_CAP kill_grace=$KILL_GRACE priority_aging=$PRIORITY_AGING_SECONDS"
 }
 
 # 列出某 session 内仍存活的所有进程。任务经 setsid 启动，SID==TASK_PID，
@@ -927,7 +939,7 @@ mkdir -p "$FIFO_DIR"
 chmod 1777 "$FIFO_DIR" 2>/dev/null
 
 log "task-daemon started (pid=$$)"
-log "scheduler loaded: mode=$SCHEDULER_MODE api=$SCHEDULER_MODULE_API_VERSION"
+log "scheduler loaded: mode=$SCHEDULER_MODE api=$SCHEDULER_MODULE_API_VERSION priority_aging=$PRIORITY_AGING_SECONDS"
 log "device groups: ${DEVICE_GROUPS:-<none>}"
 
 RUNNING=true

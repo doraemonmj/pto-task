@@ -14,6 +14,10 @@
 #   task-submit --maintenance [on|off|status]       维护模式管理
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=schedulers/_priority.sh
+if [[ -f "$SCRIPT_DIR/schedulers/_priority.sh" ]]; then
+    source "$SCRIPT_DIR/schedulers/_priority.sh"
+fi
 # Keep monitoring entirely outside configuration, admission and submission.
 # In particular TASKQUEUE_CONF and the caller's project/environment are ignored.
 if [[ "${1:-}" == --monitor || ( "${1:-}" == --json && "${2:-}" == --monitor ) ]]; then
@@ -44,6 +48,10 @@ unset DEVICE_GROUPS
 if [ -f "$CONF_FILE" ]; then
     source "$CONF_FILE"
 fi
+# The ledger location follows the configuration path, not configuration
+# contents, so a submitter-supplied variable cannot redirect administrator
+# commands to another file.
+PRIORITY_FILE="${CONF_FILE%.conf}-priority.conf"
 if [[ -n "$SUBMITTER_PTOAS_BASE" ]]; then
     export PTOAS_BASE="$SUBMITTER_PTOAS_BASE"
 fi
@@ -194,15 +202,19 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
 用卡采样指标（--stats / --device-usage / --usage-ranking 共用）:
   占卡后按卡每 15 秒采样一次；查询失败、超时记为未知，不算空闲。
    有效样本      成功采到的单卡次数，随卡数和占卡时长增加，短任务可能为 0。
-   有效覆盖率    有效采样卡秒 / 占卡卡秒（任务时长 × 卡数）。
    用卡时间占比  有计算活动的卡秒 / 占卡卡秒，上限 100%，即实际用卡时间占比；
                  采样空洞不计；无有效样本时为未知，不当作 0。
+   采样完整度    连续有效采样卡秒 / 占卡卡秒；反映采样数据可信度，不是利用率；
+                 任务头尾与采样空洞都不计入分子，所以通常低于 100%。
    疑似空闲      拿到全部卡后连续 60 秒有效零计算才标记，不杀任务、不释放卡。
   --stats 非 root 只看自己的记录；--usage-ranking 汇总所有用户，且不统计整体
   时长不超过 30 秒的任务。采样仅供参考，不参与调度和权威卡时统计。
 
 管理:
   task-submit --list                           列出所有任务
+  task-submit --priority [list]                查看优先排队授权及剩余时间
+  sudo task-submit --priority grant <user> [--days N]  授权优先排队（默认/最多 14 天）
+  sudo task-submit --priority revoke <user>    立即撤销授权
   task-submit --cancel <task-id>               取消尚未执行的任务
   task-submit --kill <task-id>                 终止运行中的任务
   task-submit --clean [--days N]               清理 N 天前的过期任务（默认 1，含 done 和 pending）
@@ -313,7 +325,7 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
             PTOAS_VERSION="$2"; shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
-        --version|--skill|--device-usage|--usage-ranking|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--help|-h)
+        --version|--skill|--device-usage|--usage-ranking|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--priority|--help|-h)
             break ;;
         # 未知选项必须硬失败。此处曾是 `*) break`，会把未识别的 flag 连同其后的
         # --run/--timeout 一起当作任务命令提交，且 RUN_MODE 未置位时静默 exit 0
@@ -2046,6 +2058,152 @@ show_device_occupancy() {
     echo ""
 }
 
+# --- 优先队列 ---------------------------------------------------------------
+
+format_remaining() {
+    local seconds="$1"
+    if (( seconds >= 86400 )); then
+        printf '%d 天' $((seconds / 86400))
+    elif (( seconds >= 3600 )); then
+        printf '%d 小时' $((seconds / 3600))
+    else
+        printf '%d 分钟' $(((seconds + 59) / 60))
+    fi
+}
+
+show_priority_banner() {
+    local user expiry remaining now out=""
+    local -a users
+    declare -F priority_load_grants >/dev/null || return 0
+    priority_load_grants
+    (( ${#PRIORITY_GRANT_UNTIL[@]} )) || return 0
+    printf -v now '%(%s)T' -1
+    mapfile -t users < <(printf '%s\n' "${!PRIORITY_GRANT_UNTIL[@]}" | sort)
+    for user in "${users[@]}"; do
+        expiry="${PRIORITY_GRANT_UNTIL[$user]}"
+        remaining=$((expiry - now))
+        out+="${out:+, }${user}($(format_remaining "$remaining"))"
+    done
+    echo "${C_DIM}优先队列: ${out}${C_RESET}"
+    echo ""
+}
+
+priority_list() {
+    local user expiry remaining now
+    local -a users
+    if ! declare -F priority_load_grants >/dev/null; then
+        echo "${C_RED}错误: 优先队列组件未安装完整，请重新运行 setup.sh${C_RESET}" >&2
+        return 1
+    fi
+    priority_load_grants
+    if (( ${#PRIORITY_GRANT_UNTIL[@]} == 0 )); then
+        echo "优先队列: 无有效授权"
+        return 0
+    fi
+    printf -v now '%(%s)T' -1
+    mapfile -t users < <(printf '%s\n' "${!PRIORITY_GRANT_UNTIL[@]}" | sort)
+    echo "优先队列（到期后需重新授权）:"
+    for user in "${users[@]}"; do
+        expiry="${PRIORITY_GRANT_UNTIL[$user]}"
+        remaining=$((expiry - now))
+        printf '  %-20s 剩余 %-8s 到期 %s\n' "$user" \
+            "$(format_remaining "$remaining")" "$(date -d "@$expiry" '+%Y-%m-%d %H:%M')"
+    done
+}
+
+priority_grant() {
+    local user="" days="$PRIORITY_GRANT_MAX_DAYS" now expiry existing
+    while (( $# )); do
+        case "$1" in
+            --days)
+                [[ $# -ge 2 ]] || {
+                    echo "${C_RED}错误: --days 需要天数${C_RESET}" >&2
+                    return 1
+                }
+                days="$2"
+                shift 2
+                ;;
+            -*) echo "${C_RED}错误: 未知选项 '$1'${C_RESET}" >&2; return 1 ;;
+            *)
+                [[ -z "$user" ]] || {
+                    echo "${C_RED}错误: 一次只能授权一个用户${C_RESET}" >&2
+                    return 1
+                }
+                user="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "${C_RED}错误: 只有 root 可以授权优先队列${C_RESET}" >&2
+        echo "${C_DIM}用法: sudo task-submit --priority grant <user> [--days N]${C_RESET}" >&2
+        return 1
+    fi
+    [[ -n "$user" ]] || {
+        echo "${C_RED}错误: 需要用户名${C_RESET}" >&2
+        return 1
+    }
+    if [[ ! "$days" =~ ^[1-9][0-9]*$ ]] || (( days > PRIORITY_GRANT_MAX_DAYS )); then
+        echo "${C_RED}错误: 授权天数必须在 1 到 $PRIORITY_GRANT_MAX_DAYS 之间${C_RESET}" >&2
+        return 1
+    fi
+    getent passwd "$user" >/dev/null 2>&1 || {
+        echo "${C_RED}错误: 用户 '$user' 不存在${C_RESET}" >&2
+        return 1
+    }
+    existing=$(priority_expiry_of "$user" || true)
+    if [[ -n "$existing" ]]; then
+        echo "${C_RED}错误: $user 已有授权，到期时间 $(date -d "@$existing" '+%Y-%m-%d %H:%M')${C_RESET}" >&2
+        echo "${C_DIM}授权到期后才能重新设定；如需立即调整，先执行 --priority revoke $user${C_RESET}" >&2
+        return 1
+    fi
+    printf -v now '%(%s)T' -1
+    expiry=$((now + days * 86400))
+    priority_write_grant "$user" "$expiry" "$now" || {
+        echo "${C_RED}错误: 写入优先队列授权失败: $PRIORITY_FILE${C_RESET}" >&2
+        return 1
+    }
+    echo "已授权 $user 优先排队 $days 天，到期 $(date -d "@$expiry" '+%Y-%m-%d %H:%M')"
+    echo "${C_DIM}授权即时生效；到期后需要重新设定${C_RESET}"
+}
+
+priority_revoke() {
+    local user="${1:-}"
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "${C_RED}错误: 只有 root 可以撤销优先队列授权${C_RESET}" >&2
+        return 1
+    fi
+    [[ -n "$user" ]] || {
+        echo "${C_RED}错误: 需要用户名${C_RESET}" >&2
+        return 1
+    }
+    if priority_remove_grant "$user"; then
+        echo "已撤销 $user 的优先排队授权"
+    else
+        echo "$user 当前没有授权" >&2
+        return 1
+    fi
+}
+
+priority_cmd() {
+    local action="${1:-list}"
+    shift || true
+    if ! declare -F priority_load_grants >/dev/null; then
+        echo "${C_RED}错误: 优先队列组件未安装完整，请重新运行 setup.sh${C_RESET}" >&2
+        return 1
+    fi
+    case "$action" in
+        list) priority_list ;;
+        grant) priority_grant "$@" ;;
+        revoke) priority_revoke "$@" ;;
+        *)
+            echo "${C_RED}错误: --priority 只支持 list / grant / revoke${C_RESET}" >&2
+            return 1
+            ;;
+    esac
+}
+
 # 列出任务（增强版）
 list_tasks() {
     local has_any=false
@@ -2060,6 +2218,8 @@ list_tasks() {
         [[ -n "$reason" ]] && echo "${C_DIM}    原因: $reason${C_RESET}"
         echo ""
     fi
+
+    show_priority_banner
 
     # Pending
     local pending_files=("$PENDING_DIR"/task_*)
@@ -2243,6 +2403,10 @@ case "${1:-}" in
     --usage)
         shift
         exec python3 "$SCRIPT_DIR/usage_report.py" "${@:-status}"
+        ;;
+    --priority)
+        shift
+        priority_cmd "${@:-list}"
         ;;
     --help|-h|"")
         usage
