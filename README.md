@@ -262,7 +262,7 @@ privileged. Restart the daemon after changing this setting.
 `pto-task --stats [--days N]` (or `task-submit --stats`) reports task count,
 card-hours and legacy sampled utilization, plus a separate in-task telemetry
 table: held card-hours, card-active-time ratio, suspected idle card-hours,
-sampling completeness, valid samples and idle-event count. The telemetry table
+sampling completeness and valid samples. The telemetry table
 selects tasks by their start time; original task accounting retains its
 overlapping-time-window rules.
 Ordinary users see their own telemetry; root sees all users.

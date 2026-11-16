@@ -597,7 +597,8 @@ class ReportColumnTests(unittest.TestCase):
         text = captured.getvalue()
         header = next(line for line in text.splitlines() if line.startswith('用户'))
         self.assert_ordered(header, ('占卡总时间(h)', '占卡有效时间', '疑似空闲卡时(h)',
-                                    '采样完整度', '有效样本', '空闲事件'))
+                                    '采样完整度', '有效样本'))
+        self.assertNotIn('空闲事件', header)
         self.assertNotIn('有效覆盖率', text)
         self.assertNotIn('用卡时间占比', text)
         row = next(line for line in text.splitlines() if line.startswith('alice'))
