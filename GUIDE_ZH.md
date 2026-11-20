@@ -406,3 +406,23 @@ JSON 接口返回 `schema_version`、`status`、`short_tasks_excluded` 和 `rank
 任务命令、环境或单条事件。排名仅供参考；原有 `--stats` 的个人查看范围不变。
 每次有效采样取 AI Core、AI Vector、AI CPU、AI Cube 和 NPU 利用率中已识别指标
 的最大值，不包含 HBM 占用和控制 CPU 使用率。坏记录会跳过，不中断整个排名。
+
+## 受限用户：并发占卡上限
+
+```bash
+sudo task-submit --user-limit set alice 2  # 所有运行任务合计最多占用 2 张卡
+sudo task-submit --user-limit set alice 0  # 禁止占卡；CPU 任务仍可运行
+task-submit --user-limit list
+sudo task-submit --user-limit remove alice  # 解除限制
+```
+
+只有 root 可以设置或解除限制。单次申请超过上限直接拒绝；单次申请未超上限、
+但该用户已有任务占满额度时，新任务排队等待。自动分卡和手动指定卡号都受限制，
+拆成多个任务、改任务里的用户名或取得优先排队授权均不能绕过。额度不足的任务
+不会阻塞其他用户和 CPU 任务，也不会建立设备池预留屏障。
+
+配置保存在主配置旁的 `taskqueue-user-limits.conf`，按真实 UID 识别账户，
+即时生效，无需重启守护进程。降低上限不会终止已运行的任务，新任务等用量降到
+允许范围后才启动。未设置限制的用户维持原有行为，安装或更新不会自动限制任何用户。
+文件缺失表示没有配置限制；文件格式错误或权限不安全时，新的设备任务暂停启动，
+直到管理员修复配置。

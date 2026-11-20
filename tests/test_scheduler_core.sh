@@ -232,6 +232,7 @@ run_dynamic_module_case() {
     cp "$REPO_DIR/task-daemon.sh" "$app/task-daemon.sh"
     cp "$REPO_DIR/schedulers/_core.sh" "$app/schedulers/_core.sh"
     cp "$REPO_DIR/schedulers/_priority.sh" "$app/schedulers/_priority.sh"
+    cp "$REPO_DIR/schedulers/_user_limits.sh" "$app/schedulers/_user_limits.sh"
     cat > "$app/schedulers/future_policy.sh" <<'EOF'
 SCHEDULER_MODULE_API_VERSION=2
 SCHEDULER_MODULE_NAME=future_policy

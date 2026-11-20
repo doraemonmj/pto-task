@@ -8,8 +8,11 @@
 
 # shellcheck source=_priority.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_priority.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_user_limits.sh"
 
 SCHEDULER_CORE_API_VERSION=1
+
+USER_LIMITS_LAST_ERROR=""
 
 SCHEDULER_DECISION=""
 SCHEDULER_DECISION_DEVICES=""
@@ -408,6 +411,42 @@ scheduler_find_free_devices() {
     return 1
 }
 
+# Identity comes from the pending file owner, never user-editable metadata.
+# Running tasks retain a daemon-written UID across root-owned rewrites/restarts.
+scheduler_user_limit_check() {
+    local task_file="$1" need="$2" uid limit rf running_uid user count used=0
+    USER_LIMIT_REASON=""
+    [[ "$need" == 0 ]] && return 0
+    if ! user_limits_load; then
+        USER_LIMIT_REASON="$USER_LIMITS_ERROR"
+        return 1
+    fi
+    (( ${#USER_DEVICE_LIMITS[@]} )) || return 0
+    uid=$(stat -c %u -- "$task_file") || return 1
+    limit="${USER_DEVICE_LIMITS[$uid]:-}"
+    [[ -n "$limit" ]] || return 0
+    if (( ${#need} > ${#limit} )) || (( need > limit )); then
+        USER_LIMIT_REASON="user device limit exceeded: requested $need, limit $limit (UID=$uid)"
+        return 2
+    fi
+    for rf in "$RUNNING_DIR"/task_*; do
+        [[ -f "$rf" && "$rf" != *.env ]] || continue
+        running_uid=$(read_field SUBMIT_UID "$rf" || true)
+        if [[ -z "$running_uid" ]]; then
+            # Existing jobs from before this feature have no UID field.
+            user=$(read_field SUBMIT_USER "$rf" || true)
+            running_uid=$(id -u -- "$user" 2>/dev/null) || continue
+        fi
+        [[ "$running_uid" == "$uid" ]] || continue
+        count=$(device_request_count "$(read_field DEVICE "$rf" || true)")
+        used=$((used + count))
+    done
+    if (( used + need > limit )); then
+        USER_LIMIT_REASON="user device quota busy: used $used, requested $need, limit $limit (UID=$uid)"
+        return 1
+    fi
+}
+
 # Re-read and validate a policy start decision immediately before claiming the
 # task. This prevents a buggy or future policy from double-allocating a device,
 # escaping an auto pool, changing the requested cardinality, or exceeding a
@@ -432,6 +471,11 @@ scheduler_start_planned_task() {
           "$current_affinity" != "${SCHEDULER_TASK_GROUP_AFFINITY:-0}" ||
           "$current_allocation_pools" != "${SCHEDULER_TASK_ALLOCATION_POOLS:-}" ]]; then
         log "scheduler reject $task_id: task device metadata changed during planning"
+        return 1
+    fi
+
+    if ! scheduler_user_limit_check "$task_file" "$pending_device_count"; then
+        log "scheduler defer $task_id: $USER_LIMIT_REASON"
         return 1
     fi
 
@@ -607,6 +651,21 @@ scheduler_schedule_tick() {
         if [[ -n "$SCHEDULER_TASK_ALLOCATION_POOLS" ]] &&
            ! scheduler_allocation_pools_valid "$SCHEDULER_TASK_ALLOCATION_POOLS"; then
             log "scheduler reject $task_id: malformed logical whitelist pools"
+            continue
+        fi
+
+        local limit_status=0
+        scheduler_user_limit_check "$task_file" "$pending_device_count" || limit_status=$?
+        if [[ "$USER_LIMITS_ERROR" != "$USER_LIMITS_LAST_ERROR" ]]; then
+            [[ -z "$USER_LIMITS_ERROR" ]] || log "user limits error: $USER_LIMITS_ERROR"
+            USER_LIMITS_LAST_ERROR="$USER_LIMITS_ERROR"
+        fi
+        if (( limit_status != 0 )); then
+            # Quota-blocked work must not create a device-pool reservation that
+            # would prevent other users from using otherwise free cards.
+            if (( limit_status == 2 )); then
+                reject_pending_task "$task_file" "$task_id" "$USER_LIMIT_REASON"
+            fi
             continue
         fi
 

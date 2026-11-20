@@ -448,6 +448,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
     chmod go-w "$TOOL_ROOT" "$APP_DIR" "$SCHEDULER_APP_DIR" "$APP_LIB_DIR" \
         "$REPO_UPDATE_MODULE_DIR" "$CONFIG_DIR" "$LOGS_DIR" "$TMP_DIR" "$UPDATE_DIR"
 fi
+install_app_file "$SCRIPT_DIR/schedulers/_user_limits.sh" "$SCHEDULER_APP_DIR/_user_limits.sh" 644
 install_app_file "$SCRIPT_DIR/task-submit.sh" "$APP_DIR/task-submit" 755
 install_app_file "$SCRIPT_DIR/pypto-setup.sh" "$APP_DIR/pypto-setup" 755
 # Install the shared core after the library it sources, then policies, and
@@ -459,7 +460,7 @@ install_app_file "$SCRIPT_DIR/schedulers/_core.sh" "$SCHEDULER_APP_DIR/_core.sh"
 for scheduler_source in "$SCRIPT_DIR"/schedulers/*.sh; do
     [[ -f "$scheduler_source" ]] || continue
     case "$(basename "$scheduler_source")" in
-        _core.sh|_priority.sh) continue ;;
+        _core.sh|_priority.sh|_user_limits.sh) continue ;;
     esac
     install_app_file "$scheduler_source" "$SCHEDULER_APP_DIR/$(basename "$scheduler_source")" 644
 done

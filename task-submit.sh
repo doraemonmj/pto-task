@@ -18,6 +18,9 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 if [[ -f "$SCRIPT_DIR/schedulers/_priority.sh" ]]; then
     source "$SCRIPT_DIR/schedulers/_priority.sh"
 fi
+if [[ -f "$SCRIPT_DIR/schedulers/_user_limits.sh" ]]; then
+    source "$SCRIPT_DIR/schedulers/_user_limits.sh"
+fi
 # Keep monitoring entirely outside configuration, admission and submission.
 # In particular TASKQUEUE_CONF and the caller's project/environment are ignored.
 if [[ "${1:-}" == --monitor || ( "${1:-}" == --json && "${2:-}" == --monitor ) ]]; then
@@ -52,6 +55,7 @@ fi
 # contents, so a submitter-supplied variable cannot redirect administrator
 # commands to another file.
 PRIORITY_FILE="${CONF_FILE%.conf}-priority.conf"
+USER_LIMITS_FILE="${CONF_FILE%.conf}-user-limits.conf"
 if [[ -n "$SUBMITTER_PTOAS_BASE" ]]; then
     export PTOAS_BASE="$SUBMITTER_PTOAS_BASE"
 fi
@@ -214,6 +218,9 @@ task-submit — 昇腾共享机的任务队列：统一排队、按需占卡
 
 管理:
   task-submit --list                           列出所有任务
+  task-submit --user-limit [list]              查看用户并发占卡上限
+  sudo task-submit --user-limit set <user> <N>  设置上限（0 禁止占卡）
+  sudo task-submit --user-limit remove <user>   解除限制
   task-submit --priority [list]                查看优先排队授权及剩余时间
   sudo task-submit --priority grant <user> [--days N]  授权优先排队（默认/最多 14 天）
   sudo task-submit --priority revoke <user>    立即撤销授权
@@ -327,7 +334,7 @@ while [[ "${1:-}" == --* || "${1:-}" == "-i" ]]; do
             PTOAS_VERSION="$2"; shift 2 ;;
         --max-time) MAX_TIME="$2"; shift 2 ;;
         # 子命令：不在此处消费，留给下面的主 case 分派
-        --version|--skill|--device-usage|--usage-ranking|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--priority|--help|-h)
+        --version|--skill|--device-usage|--usage-ranking|--wait|--status|--log|--cancel|--kill|--list|--clean|--maintenance|--devices|--find|--stats|--usage|--priority|--user-limit|--help|-h)
             break ;;
         # 未知选项必须硬失败。此处曾是 `*) break`，会把未识别的 flag 连同其后的
         # --run/--timeout 一起当作任务命令提交，且 RUN_MODE 未置位时静默 exit 0
@@ -1397,6 +1404,27 @@ submit_task() {
 
     local device_request
     device_request="$(build_device_request)"
+    if [[ -n "$device_request" && "$device_request" != none ]]; then
+        if ! declare -F user_limits_load >/dev/null || ! user_limits_load; then
+            echo "错误: 无法读取用户卡数限制，请联系管理员 ${USER_LIMITS_ERROR:-组件缺失}" >&2
+            return 1
+        fi
+        local uid limit need
+        uid=$(id -u)
+        limit="${USER_DEVICE_LIMITS[$uid]:-}"
+        case "$device_request" in
+            auto) need=1 ;;
+            auto:*) need="${device_request#auto:}" ;;
+            *) local -a ids; IFS=',' read -ra ids <<< "$device_request"; need=${#ids[@]} ;;
+        esac
+        if [[ -n "$limit" ]] && { (( ${#need} > ${#limit} )) || (( need > limit )); }; then
+            echo "错误: 用户 $(id -un) 最多同时使用 $limit 张卡，本次申请 $need 张，已拒绝" >&2
+            return 1
+        fi
+        if [[ -n "$limit" ]]; then
+            echo "提示: 用户并发占卡上限 $limit 张，额度不足时任务将等待" >&2
+        fi
+    fi
 
     # auto 模式下检测命令中是否已包含 npu-lock → 报错
     if is_auto_device_request || [[ -z "$LOCK_DEVICE" ]]; then
@@ -2206,6 +2234,47 @@ priority_cmd() {
     esac
 }
 
+user_limit_cmd() {
+    local action="${1:-list}" user="${2:-}" limit="${3:-}" uid
+    declare -F user_limits_load >/dev/null || {
+        echo "错误: 用户卡数限制组件缺失，请重新安装" >&2; return 1;
+    }
+    case "$action" in
+        list)
+            [[ $# -le 1 ]] || { echo "用法: task-submit --user-limit list" >&2; return 1; }
+            user_limits_load || { echo "错误: $USER_LIMITS_ERROR" >&2; return 1; }
+            printf '用户并发占卡限制（未列出的用户不受此限制）\n'
+            local entry account
+            while IFS= read -r uid; do
+                [[ -n "$uid" ]] || continue
+                entry=$(getent passwd "$uid" || true)
+                account="${entry%%:*}"
+                printf '  %-20s UID=%-10s 上限 %s 张\n' "${account:-已删除用户}" "$uid" "${USER_DEVICE_LIMITS[$uid]}"
+            done < <(printf '%s\n' "${!USER_DEVICE_LIMITS[@]}" | sort -n)
+            ;;
+        set|remove)
+            [[ "$(id -u)" == 0 ]] || { echo "错误: 只有 root 可以修改用户卡数限制" >&2; return 1; }
+            if [[ -z "$user" || ( "$action" == set && $# != 3 ) ||
+                  ( "$action" == remove && $# != 2 ) ]]; then
+                echo "用法: sudo task-submit --user-limit set <user> <N> / remove <user>" >&2
+                return 1
+            fi
+            [[ "$user" =~ ^[A-Za-z0-9._-]+\$?$ ]] || { echo "错误: 无效用户名" >&2; return 1; }
+            uid=$(id -u -- "$user" 2>/dev/null) || { echo "错误: 用户 '$user' 不存在" >&2; return 1; }
+            if [[ "$action" == set ]]; then
+                [[ "$limit" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { echo "错误: 卡数必须是 0 到 999999 的整数" >&2; return 1; }
+                user_limits_write "$uid" "$user" "$limit" || return 1
+                echo "已限制 $user (UID=$uid) 最多同时占用 $limit 张卡"
+            else
+                user_limits_write "$uid" "$user" remove || return 1
+                echo "已解除 $user (UID=$uid) 的占卡限制"
+            fi
+            echo "限制即时生效；已运行任务继续完成，新任务按最新上限调度"
+            ;;
+        *) echo "错误: --user-limit 只支持 list / set / remove" >&2; return 1 ;;
+    esac
+}
+
 # 列出任务（增强版）
 list_tasks() {
     local has_any=false
@@ -2406,6 +2475,10 @@ case "${1:-}" in
         shift
         exec python3 "$SCRIPT_DIR/usage_report.py" "${@:-status}"
         ;;
+    --user-limit)
+        shift
+        user_limit_cmd "$@"
+        ;;
     --priority)
         shift
         priority_cmd "${@:-list}"
@@ -2422,7 +2495,7 @@ case "${1:-}" in
             exit 1
         fi
         resolve_ptoas
-        task_id=$(submit_task "$1")
+        task_id=$(submit_task "$1") || exit $?
         show_eight_card_policy_notice "$(build_device_request)"
         if [[ "$RUN_MODE" == "true" ]]; then
             echo "${C_DIM}任务已提交: $task_id (断开后可用 task-submit --wait $task_id 重连)${C_RESET}" >&2

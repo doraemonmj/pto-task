@@ -51,6 +51,7 @@ if [[ ! "$PRIORITY_AGING_SECONDS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 PRIORITY_FILE="${CONF_FILE%.conf}-priority.conf"
+USER_LIMITS_FILE="${CONF_FILE%.conf}-user-limits.conf"
 # Optional per-host admission limit for jobs that request exactly eight cards.
 # Zero keeps historical scheduling behavior, so code updates do not enable the
 # policy on hosts whose preserved local configuration does not opt in.
@@ -803,6 +804,18 @@ log() {
     echo "[$(date -Iseconds)] $*" >> "$LOG_FILE"
 }
 
+# Reject an impossible request even when it came from an old/modified client.
+# Claim first so cancellation cannot race publication of the rejected result.
+reject_pending_task() (
+    local task_file="$1" task_id="$2" reason="$3"
+    mv -- "$task_file" "$RUNNING_DIR/$task_id" 2>/dev/null || return 0
+    [[ ! -f "$PENDING_DIR/$task_id.env" ]] || mv -- "$PENDING_DIR/$task_id.env" "$RUNNING_DIR/$task_id.env"
+    parse_task_file "$RUNNING_DIR/$task_id"
+    SUBMIT_USER=$(stat -c %U -- "$RUNNING_DIR/$task_id")
+    write_reject "$task_id" "error: $reason"
+    log "reject $task_id: $reason"
+)
+
 # Claim and launch a task selected by the active scheduler. Policy modules do
 # not move queue files or start processes directly; this keeps the atomic state
 # transition and the in-tick resource accounting in daemon core.
@@ -811,6 +824,9 @@ start_pending_task() {
     local task_id="$2"
     local pending_dev="$3"
     local pending_device_count="$4"
+    local submit_uid submit_user
+    submit_uid=$(stat -c %u -- "$task_file") || return 1
+    submit_user=$(id -un -- "$submit_uid") || return 1
 
     log "processing: $task_id"
 
@@ -823,9 +839,18 @@ start_pending_task() {
     chmod 644 "$RUNNING_DIR/$task_id" 2>/dev/null || log "warning: cannot normalize permissions for $task_id"
     [ -f "$PENDING_DIR/${task_id}.env" ] && mv "$PENDING_DIR/${task_id}.env" "$RUNNING_DIR/${task_id}.env" 2>/dev/null
 
-    # Resolve DEVICE only after the sticky-directory claim succeeds.
+    # Freeze submission identity before root-owned device rewrites. Ignore any
+    # forged SUBMIT_USER/SUBMIT_UID supplied by a client.
+    # Canonicalize DEVICE too, including no-device jobs: duplicate fields must
+    # not let the parser execute a different allocation from the planner's.
+    if ! sed -i '/^SUBMIT_USER=/d; /^SUBMIT_UID=/d; /^DEVICE=/d' "$RUNNING_DIR/$task_id" ||
+       ! printf 'SUBMIT_USER=%s\nSUBMIT_UID=%s\nDEVICE=%s\n' "$submit_user" "$submit_uid" "$pending_dev" >> "$RUNNING_DIR/$task_id"; then
+        parse_task_file "$RUNNING_DIR/$task_id"
+        write_reject "$task_id" "error: could not freeze task identity/allocation"
+        return 1
+    fi
+
     if [[ -n "$pending_dev" && "$pending_dev" != "none" ]]; then
-        sed -i "s/^DEVICE=.*/DEVICE=$pending_dev/" "$RUNNING_DIR/$task_id"
         IN_USE_SET="$IN_USE_SET$pending_dev,"
     fi
 
@@ -855,7 +880,7 @@ load_scheduler() {
         echo "error: scheduler module directory is missing or unsafe: $scheduler_dir" >&2
         return 1
     fi
-    for path in "$scheduler_core" "$scheduler_module"; do
+    for path in "$scheduler_core" "$scheduler_module" "$scheduler_dir/_user_limits.sh"; do
         if [[ -L "$path" || ! -f "$path" ]]; then
             echo "error: unsupported SCHEDULER_MODE '$SCHEDULER_MODE'" >&2
             return 1
@@ -871,7 +896,7 @@ load_scheduler() {
             echo "error: scheduler module and its parent must be root-owned and not group/world-writable" >&2
             return 1
         fi
-        for path in "$scheduler_core" "$scheduler_module"; do
+        for path in "$scheduler_core" "$scheduler_module" "$scheduler_dir/_user_limits.sh"; do
             if [[ "$(stat -c %u "$path")" -ne 0 ||
                   $((8#$(stat -c %a "$path") & 8#022)) -ne 0 ]]; then
                 echo "error: scheduler module and its parent must be root-owned and not group/world-writable" >&2

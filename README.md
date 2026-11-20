@@ -218,6 +218,34 @@ repository scheduler files. The leading-underscore files (`_core.sh`,
 `_priority.sh`) cannot be selected as a mode. Installed scheduler files and
 their directory must remain root-owned and not group/world-writable.
 
+### Per-user device limits
+
+Administrators can restrict a user's total concurrent device allocation:
+
+```bash
+sudo task-submit --user-limit set alice 2   # at most two cards across all running tasks
+sudo task-submit --user-limit set alice 0   # no device jobs; CPU jobs still allowed
+task-submit --user-limit list
+sudo task-submit --user-limit remove alice  # unrestricted again
+```
+
+A single request exceeding the limit is rejected before submission. Requests
+within the limit wait when the user's running tasks already consume the quota;
+other users and CPU jobs can continue. Both automatic and explicit device
+requests are checked again by the daemon, so splitting jobs, editing the
+submitted username, or using an older client cannot bypass the limit. Limits
+apply before scheduling policies or reservation barriers and cannot be bypassed
+by a priority grant.
+
+Limits persist in `config/taskqueue-user-limits.conf`, alongside the main
+configuration, as `<uid> <username> <max_concurrent_devices>`. Only root can
+change them. The UID identifies the account; the stored username is descriptive.
+The daemon reads changes without a restart. Reducing a limit lets existing jobs
+finish and blocks new device allocations until usage fits the new limit. Users
+without an entry retain their existing unrestricted behavior; updates do not
+restrict anyone automatically. A missing ledger means no restrictions, while
+an unsafe or malformed ledger blocks new device starts until repaired.
+
 ### Priority queue
 
 An administrator can give a user time-limited head-of-queue ordering:

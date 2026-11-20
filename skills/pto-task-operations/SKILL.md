@@ -119,3 +119,11 @@ Granting priority queueing is also an administrator action: `sudo task-submit
 it never preempts a running task or bypasses concurrency, device-pool or
 reservation limits, and ordinary tasks join the priority bucket once they have
 waited `PRIORITY_AGING_SECONDS`.
+
+
+Only administrators set per-user card limits: `sudo task-submit --user-limit
+set <user> <N>` or `remove <user>`; anyone may run `--user-limit list`.
+The cap covers all of that user's running allocations combined. Oversized
+requests are refused; requests within the cap wait for the user's quota to free
+up. A zero cap permits CPU-only jobs but no device jobs. Do not set a user's
+limit without the requested username and card count.

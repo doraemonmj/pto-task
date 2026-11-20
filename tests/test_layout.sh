@@ -44,6 +44,8 @@ grep -Fq "export GCC15_ROOT=''" <<< "$installed_pypto_exports"
 [[ -f "$INSTALL_ROOT/app/schedulers/pool_aware_reservation.sh" ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers")" == 755 ]]
 [[ -f "$INSTALL_ROOT/app/schedulers/_priority.sh" ]]
+[[ -f "$INSTALL_ROOT/app/schedulers/_user_limits.sh" ]]
+[[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/_user_limits.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/_core.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/_priority.sh")" == 644 ]]
 [[ "$(stat -c %a "$INSTALL_ROOT/app/schedulers/backfill.sh")" == 644 ]]
@@ -405,6 +407,7 @@ bash "$REPO_DIR/tests/test_deploy_upgrade_guard.sh"
 bash "$REPO_DIR/tests/test_eight_card_limit.sh"
 bash "$REPO_DIR/tests/test_scheduler_core.sh"
 bash "$REPO_DIR/tests/test_priority_queue.sh"
+bash "$REPO_DIR/tests/test_user_limits.sh"
 bash "$REPO_DIR/tests/test_pool_aware_reservation.sh"
 bash "$REPO_DIR/tests/test_device_group_affinity.sh"
 bash "$REPO_DIR/tests/test_whitelist_pools.sh"
