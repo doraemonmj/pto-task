@@ -1,15 +1,34 @@
 ---
 name: pto-task-operations
-description: Submit and run NPU work through the pypto TaskQueue, and read its usage telemetry. Use when working with task-submit or pto-task submissions, device allocation, queue status/logs, device-usage sampling, --stats, or --usage-ranking. For install, deployment, scheduler policy or host configuration, see the repository README.
+description: Run only the on-device stage through the pypto TaskQueue; keep compilation and other CPU preparation outside task-submit. Also read queue and usage telemetry. Use when working with task-submit or pto-task submissions, device allocation, queue status/logs, device-usage sampling, --stats, or --usage-ranking. For install, deployment, scheduler policy or host configuration, see the repository README.
 ---
 
 # TaskQueue operations
 
-`task-submit` and `pto-task` are the same client; both queue work and allocate
-cards. Every command that touches an NPU goes through the queue — never run one
-around it. Compile, install dependencies and generate inputs outside the card
-allocation, then submit only the on-device run. CPU-only queued work uses
-`--no-device`.
+## First rule: CPU preparation outside, only the device run inside
+
+**Compile, install dependencies and generate inputs before calling
+`task-submit`. Submit only the innermost on-device stage, then aggregate results
+and generate reports after the device task finishes. Never submit the whole
+build-and-test workflow.** `task-submit` and `pto-task` are aliases and follow
+the same rule.
+
+“Innermost” describes the execution boundary: the submitted command must run
+the prepared device workload. Inspect the scripts and subprocesses it invokes;
+a single Python or shell entry point that also builds or prepares data still
+violates this boundary. Having only one queue submission does not make a mixed
+CPU/device workflow compliant. The scheduler holds every requested card for the
+whole process, including time spent on CPU work.
+
+- Correct: CPU build and preparation → `task-submit` (device run) → CPU reports.
+- Forbidden: `task-submit` (CPU build → preparation → device run → reports).
+
+When reviewing compliance, explicitly check whether compilation or other CPU
+stages ran inside the submitted process. If JIT compilation cannot be separated,
+report that limitation; do not claim it moved outside the allocation.
+
+Device queries, architecture prechecks and ACL initialization are part of the
+device stage and must stay inside the same allocated job as the test.
 
 ## Before submitting
 
@@ -25,8 +44,7 @@ cmake --build build -j 8 &&
   whole submitted process; releasing a runtime handle inside it returns nothing.
   Related cases that share one configuration may run in a single submission, each
   keeping its own pass/fail result. Do not put builds, installs, input generation,
-  aggregation, long sweeps or unrelated work in a device task. If JIT compilation
-  cannot be separated, say so rather than claiming it moved outside.
+  aggregation, long sweeps or unrelated work in a device task.
 - Architecture prechecks, `npu-smi`, DCMI and ACL initialization access devices
   and belong inside the same allocated job as the test, even though they look like
   preparation. Never run a hardware query from the submitter shell or a
@@ -42,12 +60,16 @@ cmake --build build -j 8 &&
 
 ## While the task runs
 
+- Do not submit from inside an already queued task or wrap an AI agent or runner
+  that submits tasks in an outer submission. Only the innermost device runner
+  owns submission; this also applies to `pto-task` and `--no-device`.
+- CPU-only work stays outside `task-submit` by default. Use `--no-device` only
+  when CPU work itself needs queueing; never put it in a device allocation.
 - Use `--status`, `--log`, `--wait`, `--cancel` and `--kill` with the task id.
 - Long runs need `--max-time 0`; the default 300 s kills the task.
 - Interactive runs use `-i` with `--run` and a real terminal (line-based stdin
   only; stdin cannot be reconnected after a disconnect).
-- Do not call `task-submit` inside a task (nested submissions are rejected) and
-  do not wrap `npu-lock` yourself; the daemon locks the cards.
+- Do not wrap `npu-lock` yourself; the daemon locks the cards.
 - Dangerous commands (`rm -rf /`, `mkfs`, `reboot`, ...) are rejected by
   substring matching; rewrite the command instead of fighting the filter.
 - `task-submit --help` lists every option, including `--ptoas`, `--env` and the
