@@ -54,12 +54,8 @@ grep -Eq '^[[:space:]]*SCHEDULER_MODULE_API_VERSION=2$' "$INSTALL_ROOT/app/sched
 [[ -x "$INSTALL_ROOT/app/pto-task-stats" && -x "$INSTALL_ROOT/app/pto-task-usage-sampler" ]]
 [[ -f "$INSTALL_ROOT/app/pto-task.service" && -f "$INSTALL_ROOT/app/pto-task-clean.cron" ]]
 grep -Fqx "ExecStart=$INSTALL_ROOT/app/task-daemon" "$INSTALL_ROOT/app/pto-task.service"
-# The unit must carry no Alias=. It is installed by symlink from outside the
-# systemd search path, so `systemctl enable` would render an Alias= as a second
-# symlink to that same external path -- which systemd loads as an independent
-# unit that restart-loops against the daemon's single-instance lock. setup.sh
-# installs the taskqueue.service compatibility name as a symlink to
-# /etc/systemd/system/pto-task.service instead.
+grep -Fqx "RequiresMountsFor=$INSTALL_ROOT/app" "$INSTALL_ROOT/app/pto-task.service"
+# setup.sh manages the taskqueue.service alias explicitly during upgrades.
 # Spelled out rather than `! grep -q ...` because set -e is specified to ignore
 # a command whose status is inverted by `!`, which would make this silently
 # unable to fail.
@@ -118,6 +114,9 @@ grep -q '^AUTO_UPDATE_IDLE_WAIT_SECONDS=7200' "$INSTALL_ROOT/config/taskqueue.co
 grep -q '^AUTO_UPDATE_IDLE_WAIT_MAX_SECONDS=7200' "$INSTALL_ROOT/config/taskqueue.conf"
 [[ "$(stat -c %a "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 666 ]]
 if [[ "$(id -u)" -eq 0 ]]; then
+    daemon_unit=/etc/systemd/system/pto-task.service
+    [[ -f "$daemon_unit" && ! -L "$daemon_unit" ]]
+    cmp "$INSTALL_ROOT/app/pto-task.service" "$daemon_unit"
     [[ "$(stat -c %u "$INSTALL_ROOT/state/locks/update-reservation.lock")" == 0 ]]
     for root_dir in "$INSTALL_ROOT" "$INSTALL_ROOT/app" "$INSTALL_ROOT/app/schedulers" "$INSTALL_ROOT/config" \
         "$INSTALL_ROOT/app/lib" "$INSTALL_ROOT/app/lib/repo-auto-update" \

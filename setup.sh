@@ -235,7 +235,7 @@ install_app_file() {
 
 write_app_file() {
     local destination="$1" mode="$2" content="$3" temp
-    temp="$(mktemp "$APP_DIR/.pto-task-write.XXXXXX")"
+    temp="$(mktemp "${destination%/*}/.pto-task-write.XXXXXX")"
     if ! printf '%s' "$content" > "$temp"; then
         rm -f "$temp"
         return 1
@@ -710,7 +710,13 @@ if [[ -f "$CONFIG_FILE" && "$(id -u)" -eq 0 ]]; then
     usage_report_enabled="$(bash -c 'source "$1"; printf "%s" "${USAGE_REPORT_ENABLED:-false}"' _ "$CONFIG_FILE")"
     usage_monitor_enabled="$(bash -c 'source "$1"; printf "%s" "${USAGE_MONITOR_ENABLED:-true}"' _ "$CONFIG_FILE")"
     install -d -m 755 /etc/systemd/system
-    ln -sfn "$APP_DIR/pto-task.service" /etc/systemd/system/pto-task.service
+    # systemd must read RequiresMountsFor before the application disk is mounted.
+    daemon_unit=/etc/systemd/system/pto-task.service
+    write_app_file "$daemon_unit" 644 "$rendered_service"$'\n'
+    boot_link=/etc/systemd/system/multi-user.target.wants/pto-task.service
+    if [[ -L "$boot_link" ]]; then
+        ln -sfnT "$daemon_unit" "$boot_link"
+    fi
     # Upgrade path: earlier installs pointed taskqueue.service at the same
     # external file as pto-task.service, which systemd loads as a second,
     # independent unit that restart-loops against the daemon's single-instance
